@@ -3,8 +3,8 @@ import os
 import ida_hexrays
 
 from d810.core import getLogger
-from d810.expr.ast import minsn_to_ast
-from d810.hexrays.hexrays_formatters import (
+from d810.hexrays.ir.minsn_utils import minsn_to_ast
+from d810.hexrays.utils.hexrays_formatters import (
     format_minsn_t,
     format_mop_t,
     maturity_to_string,

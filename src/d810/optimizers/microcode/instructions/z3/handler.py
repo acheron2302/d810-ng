@@ -3,7 +3,7 @@ from d810.core import typing
 
 import ida_hexrays
 
-from d810.expr.ast import AstNode, AstNodeProtocol
+from d810.hexrays.expr.ast import AstNode, AstNodeProtocol
 from d810.optimizers.microcode.instructions.handler import (
     GenericPatternRule,
     InstructionOptimizer,
@@ -74,8 +74,7 @@ class Z3Optimizer(InstructionOptimizer):
                 self._has_patternless_rule = True
                 self._allowed_root_opcodes.clear()
             # Use Protocol for hot-reload safety
-            elif isinstance(pat, AstNodeProtocol) and pat.opcode is not None:
-                # Only add to filter if we haven't disabled it
+            elif isinstance(pat, AstNodeProtocol) and pat.opcode is not None:                # Only add to filter if we haven't disabled it
                 if not self._has_patternless_rule:
                     self._allowed_root_opcodes.add(int(pat.opcode))
         except Exception:

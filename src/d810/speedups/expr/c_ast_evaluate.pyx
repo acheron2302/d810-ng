@@ -2,6 +2,16 @@
 # cython: language_level=3, embedsignature=True
 # cython: cdivision=True
 # distutils: define_macros=__EA64__=1
+# DEPRECATED: This module has been superseded by
+# ``d810.speedups.evaluator.c_concrete`` (``CythonConcreteEvaluator``), which
+# follows the ``d810.speedups.<pkgname>`` convention and uses the
+# :meth:`~d810.evaluator.helpers.rotate._RotateHelper.lookup` for helper lookup.
+#
+# This file is kept for one release cycle to avoid breaking any direct
+# consumers of ``d810.speedups.expr.c_ast_evaluate.AstEvaluator``.
+# It will be removed in a future release.
+#
+# See ``docs/plans/2026-02-18-evaluator-package-refactor.md``, Phase 5.
 from __future__ import annotations
 
 import ida_hexrays
@@ -16,6 +26,7 @@ from d810.core.bits import (
     signed_to_unsigned,
     unsigned_to_signed,
 )
+from d810.core import bits as _rotate_helpers
 from d810.hexrays.hexrays_helpers import AND_TABLE
 
 logger = getLogger(__name__)
@@ -164,20 +175,33 @@ cdef class AstEvaluator:
                 // self.evaluate(node.right, dict_index_to_value)
             ) & res_mask
         elif node.opcode == ida_hexrays.m_sdiv and node.right is not None:
-            return (
-                self.evaluate(node.left, dict_index_to_value)
-                // self.evaluate(node.right, dict_index_to_value)
-            ) & res_mask
+            left_value_signed = unsigned_to_signed(
+                self.evaluate(node.left, dict_index_to_value), node.left.dest_size
+            )
+            right_value_signed = unsigned_to_signed(
+                self.evaluate(node.right, dict_index_to_value), node.right.dest_size
+            )
+            quotient = (abs(left_value_signed) // abs(right_value_signed)) * (
+                -1 if (left_value_signed < 0) ^ (right_value_signed < 0) else 1
+            )
+            return signed_to_unsigned(quotient, node.dest_size) & res_mask
         elif node.opcode == ida_hexrays.m_umod and node.right is not None:
             return (
                 self.evaluate(node.left, dict_index_to_value)
                 % self.evaluate(node.right, dict_index_to_value)
             ) & res_mask
         elif node.opcode == ida_hexrays.m_smod and node.right is not None:
-            return (
-                self.evaluate(node.left, dict_index_to_value)
-                % self.evaluate(node.right, dict_index_to_value)
-            ) & res_mask
+            left_value_signed = unsigned_to_signed(
+                self.evaluate(node.left, dict_index_to_value), node.left.dest_size
+            )
+            right_value_signed = unsigned_to_signed(
+                self.evaluate(node.right, dict_index_to_value), node.right.dest_size
+            )
+            quotient = (abs(left_value_signed) // abs(right_value_signed)) * (
+                -1 if (left_value_signed < 0) ^ (right_value_signed < 0) else 1
+            )
+            remainder = left_value_signed - (quotient * right_value_signed)
+            return signed_to_unsigned(remainder, node.dest_size) & res_mask
         elif node.opcode == ida_hexrays.m_or and node.right is not None:
             return (
                 self.evaluate(node.left, dict_index_to_value)
@@ -342,6 +366,23 @@ cdef class AstEvaluator:
                     node.left,
                     node.right,
                 )
+            # Attempt to evaluate rotate helper calls (__ROL*/__ROR*).
+            # func_name is populated by mop_to_ast_internal when building
+            # AST nodes for rotate helper calls.
+            helper_name = (node.func_name or "").lstrip("!")
+            if (
+                helper_name
+                and (helper_name.startswith("__ROL") or helper_name.startswith("__ROR"))
+                and node.left is not None
+                and node.right is not None
+            ):
+                helper_func = getattr(_rotate_helpers, helper_name, None)
+                if helper_func is not None:
+                    val = self.evaluate(node.left, dict_index_to_value)
+                    rot = self.evaluate(node.right, dict_index_to_value)
+                    result = helper_func(val, rot)
+                    return result & res_mask
+            # Unknown runtime value - treat as 0 to let constant evaluation proceed.
             return 0 & res_mask
         else:
             raise AstEvaluationException(

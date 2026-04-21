@@ -1,10 +1,10 @@
-"""Pattern engine dispatcher — gates between Cython and Python backends.
+"""Pattern engine dispatcher - gates between Cython and Python backends.
 
 Follows CythonMode Pattern 1 (module-level gate) established in ast.py.
 Exports normalized names so consumers don't care which backend is active.
 
 Environment variables:
-    D810_NO_CYTHON=1  — Force Python backend even if Cython is available.
+    D810_NO_CYTHON=1  - Force Python backend even if Cython is available.
 
 Usage:
     from d810.optimizers.microcode.instructions.pattern_matching.engine import (
@@ -16,13 +16,13 @@ Usage:
         RulePatternEntry,
     )
 """
+
 from __future__ import annotations
 
-import logging
-
 from d810.core.cymode import CythonMode
+from d810.core.logging import getLogger
 
-logger = logging.getLogger(__name__)
+logger = getLogger(__name__)
 
 # Always import Python data containers (no perf benefit from Cython for these)
 from d810.optimizers.microcode.instructions.pattern_matching.pattern_speedups import (
@@ -36,26 +36,31 @@ from d810.optimizers.microcode.instructions.pattern_matching.pattern_speedups im
 if CythonMode().is_enabled():
     try:
         from d810.speedups.optimizers.c_pattern_match import (
-            COpcodeIndexedStorage as OpcodeIndexedStorage,
-            match_pattern_nomut,
             CMatchBindings as MatchBindings,
         )
+        from d810.speedups.optimizers.c_pattern_match import (
+            COpcodeIndexedStorage as OpcodeIndexedStorage,
+        )
+        from d810.speedups.optimizers.c_pattern_match import match_pattern_nomut
+
         _USING_CYTHON = True
         logger.debug("Pattern engine: using Cython backend")
-    except (ModuleNotFoundError, ImportError):
+    except ImportError:
         from d810.optimizers.microcode.instructions.pattern_matching.pattern_speedups import (
+            MatchBindings,
             OpcodeIndexedStorage,
             match_pattern_nomut,
-            MatchBindings,
         )
+
         _USING_CYTHON = False
         logger.debug("Pattern engine: Cython unavailable, using Python backend")
 else:
     from d810.optimizers.microcode.instructions.pattern_matching.pattern_speedups import (
+        MatchBindings,
         OpcodeIndexedStorage,
         match_pattern_nomut,
-        MatchBindings,
     )
+
     _USING_CYTHON = False
     logger.debug("Pattern engine: CythonMode disabled, using Python backend")
 

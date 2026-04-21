@@ -159,7 +159,7 @@ cdef inline qstring _get_written_var_name(minsn_t* ins):
         mop_off_pair_t result
         qstring empty
 
-    if d.t in (MOPT.STACK, MOPT.REGISTER):
+    if d.t == MOPT.STACK:
         return _stack_var_name(d)
 
 
@@ -183,7 +183,7 @@ cdef inline bint _is_constant_stack_assignment(minsn_t* ins):
 
     if ins.l.t != MOPT.NUMBER:
         return <bint>False
-    if ins.opcode == mcode_t.m_mov and ins.d.t in (MOPT.STACK, MOPT.REGISTER):
+    if ins.opcode == mcode_t.m_mov and ins.d.t == MOPT.STACK:
         return <bint>True
     if ins.opcode == mcode_t.m_stx:
         if ins.d.t == MOPT.STACK:
@@ -279,7 +279,7 @@ cdef inline void _transfer_insn(mblock_t* blk, minsn_t* ins, CppConstMap& env):
     cdef qstring var_name
     cdef mop_off_pair_t pair
 
-    if ins.opcode == mcode_t.m_mov or ins.d.t in (MOPT.STACK, MOPT.REGISTER):
+    if ins.opcode == mcode_t.m_mov or ins.d.t == MOPT.STACK:
         var_name = _stack_var_name(&ins.d)
     else:
         pair = _extract_base_and_offset(&ins.d)
@@ -293,6 +293,15 @@ cdef inline void _transfer_insn(mblock_t* blk, minsn_t* ins, CppConstMap& env):
 
 
 cdef inline void _clear_on_side_effect(minsn_t* ins, CppConstMap& env):
+    # Known pure helpers (ROL/ROR) are m_call with mop_h (HELPER) operand but
+    # have no observable side effects on memory/stack — skip the blanket kill.
+    if ins.opcode == mcode_t.m_call and ins.l.t == MOPT.HELPER:
+        cdef const char* helper_name = ins.l.helper
+        if (helper_name[0] == b'_' and helper_name[1] == b'_'
+                and (helper_name[2] == b'R')
+                and (helper_name[3] == b'O')
+                and (helper_name[4] == b'L' or helper_name[4] == b'R')):
+            return  # pure ROL/ROR helper — preserve env
     if ins.has_side_effects(False) and ins.opcode != mcode_t.m_stx:
         env.clear()
 
@@ -318,7 +327,7 @@ cdef void _transfer_block(mblock_t* blk, const CppConstMap& INb, CppConstMap& OU
         else:
             if ins.opcode == mcode_t.m_mov:
                 var_name = _stack_var_name(&ins.d)
-            elif ins.d.t in (MOPT.STACK, MOPT.REGISTER):
+            elif ins.d.t == MOPT.STACK:
                 var_name = _stack_var_name(&ins.d)
             else:
                 res_pair = _extract_base_and_offset(&ins.d)
@@ -391,7 +400,7 @@ cpdef cy_extract_assignment(object ins_py):
     cdef int size = ins.l.size
     if ins.opcode == mcode_t.m_mov:
         var_name = _stack_var_name(&ins.d)
-    elif ins.d.t in {MOPT.STACK, MOPT.REGISTER}:
+    elif ins.d.t == MOPT.STACK:
         var_name = _stack_var_name(&ins.d)
     else:
         result = _extract_base_and_offset(&ins.d)
@@ -409,7 +418,24 @@ cpdef cy_extract_assignment(object ins_py):
 
 
 cdef bint _cy_process_operand(mop_t* op, CppConstMap& consts):
-    """C-level recursive function to replace variables with constants."""
+    """C-level recursive function to replace variables with constants.
+
+    TODO: Add is_shift_amount guard (INTERR 50835 prevention).
+    The callers _rewrite_instruction_c and cy_rewrite_instruction pass ins.r
+    to this function without indicating whether the operand is a shift-amount
+    slot.  For shift instructions (m_shl/m_shr/m_sar), the r operand must
+    have size == 1; folding a constant with a larger size triggers INTERR 50835.
+    The fix requires threading the parent opcode (or an is_shift_amount flag)
+    into _cy_process_operand so that when op is ins.r of a shift instruction
+    the make_number call uses size=1.
+    Reference implementations:
+      - Python path: forward_const_prop.py _slow_rewrite_instruction
+        (is_shift_amount flag + _SHIFT_OPCODES guard)
+      - Peephole path: fold_readonlydata.py _fold_readonly_operands_in_expr
+        (post-fixup clamps r.size to 1 after recursive fold)
+    This change requires a Cython rebuild (D810_BUILD_SPEEDUPS=1). Safe to
+    defer since Cython is disabled by default (cython_enabled=False).
+    """
     cdef:
         bint changed = <bint>False
         qstring name
@@ -425,7 +451,7 @@ cdef bint _cy_process_operand(mop_t* op, CppConstMap& consts):
         qstring full_name
         bint const_info_found
 
-    if op.t == MOPT.STACK or op.t == MOPT.REGISTER:
+    if op.t == MOPT.STACK:
         name = _stack_var_name(op)
         if not name.empty():
             it = consts.find(name)
@@ -442,7 +468,7 @@ cdef bint _cy_process_operand(mop_t* op, CppConstMap& consts):
             addr = &op.d.r
             const_info_found = <bint>False
 
-            if addr.t == MOPT.STACK or addr.t == MOPT.REGISTER:
+            if addr.t == MOPT.STACK:
                 name = _stack_var_name(addr)
                 it = consts.find(name)
                 if it != consts.end():
@@ -514,13 +540,16 @@ cpdef int cy_rewrite_instruction(object ins_py, dict consts_py):
         changed = <bint>True
     if ins.opcode == mcode_t.m_stx and _cy_process_operand(&ins.d, consts):
         changed = <bint>True
+    # m_call: args live in ins.d (mop_f); substitute constants into them
+    if ins.opcode == mcode_t.m_call and _cy_process_operand(&ins.d, consts):
+        changed = <bint>True
 
     # Let Hex-Rays perform local simplifications before folding whole instruction
     if changed:
         ins.optimize_solo(0)
 
     # If both operands are immediates for a pure binary op, fold to MOV
-    if ins.d.t in (MOPT.STACK, MOPT.REGISTER) and ins.l.t == MOPT.NUMBER and ins.r.t == MOPT.NUMBER:
+    if ins.d.t == MOPT.STACK and ins.l.t == MOPT.NUMBER and ins.r.t == MOPT.NUMBER:
         lval = ins.l.nnn.value
         rval = ins.r.nnn.value
         res = 0
@@ -757,6 +786,14 @@ cpdef int cy_run_full_pass(object mba_py):
         curr_blk = curr_blk.nextb
 
     if total_changes > 0:
+        # TODO: remove mba.mark_chains_dirty() + mba.optimize_local() here.
+        # The pure-Python path (_slow_run_on_function) no longer calls these
+        # because calling optimize_local inside an optblock_t callback re-enters
+        # IDA's optimizer pipeline and triggers INTERR 50835 (shift operand size
+        # verification failure on partially-transformed MBA).  This Cython path
+        # needs the same fix, but .pyx edits require a Cython rebuild which is
+        # currently disabled.  Safe to leave for now since Cython is disabled by
+        # default (cython_enabled=False).
         mba.mark_chains_dirty()
         mba.optimize_local(LOCOPT_FLAGS.LOCOPT_ALL)
 

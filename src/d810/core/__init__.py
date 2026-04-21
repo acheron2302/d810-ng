@@ -15,6 +15,13 @@ Modules:
     singleton   - Thread-safe SingletonMeta metaclass
     stats       - OptimizationStatistics tracking
     typing      - Cross-version typing compatibility imports
+
+Moved to d810.ctree:
+    ctree_snapshot - serialize_ctree, deserialize_ctree, save/load_ctree_snapshot
+
+Removed (dead code, 0 production consumers):
+    merkle      - MerkleTree (deleted)
+    patching    - PatchAction, PatchRecorder, BinaryPatcher (deleted)
 """
 
 # Configuration
@@ -26,7 +33,7 @@ from .config import (
     DEFAULT_IDA_USER_DIR,
 )
 
-# Logging
+# Logging (includes SQLiteHandler backend, merged from structured_logging)
 from .logging import (
     D810Logger,
     getLogger,
@@ -34,6 +41,9 @@ from .logging import (
     clear_logs,
     LoggerConfigurator,
     LevelFlag,
+    SQLiteHandler,
+    debug_scope,
+    query_logs,
 )
 
 # Caching
@@ -53,7 +63,6 @@ from .cache import (
 from .registry import (
     Registrant,
     Registry,
-    EventEmitter,
     survives_reload,
     reify,
     deferred_property,
@@ -65,9 +74,25 @@ from .registry import (
     resolve_forward_ref,
     lazy_type,
     get_all_subclasses,
+    SingletonMeta,
+    singleton,
 )
 
-from .singleton import SingletonMeta, singleton
+# Events (split out of registry for lightweight import)
+from .events import EventEmitter
+
+# Descriptors (split out of registry for lightweight import)
+from .descriptors import (
+    CombineMeta,
+    combine_meta,
+    async_await,
+    coroutine,
+    timestamp,
+    Thunk,
+    Defer,
+    TypeRef,
+    DeferTypeRef,
+)
 
 # Project management
 from .project import ProjectManager, ProjectContext
@@ -122,20 +147,6 @@ from .bits import (
 # Re-export typing module contents for convenience
 from . import typing
 
-# Merkle tree utilities
-from .merkle import MerkleTree
-
-# Binary patching helpers
-from .patching import PatchAction, PatchRecorder, BinaryPatcher
-
-# Ctree snapshot helpers
-from .ctree_snapshot import (
-    serialize_ctree,
-    deserialize_ctree,
-    save_ctree_snapshot,
-    load_ctree_snapshot,
-)
-
 # Platform and file format detection
 from .platform import (
     FileFormat,
@@ -149,7 +160,7 @@ from .platform import (
 )
 
 # Tracker components (extracted hot-path components)
-from .tracker_components import (
+from .tracker import (
     ImmutableBlockInfo,
     CachedBlockPath,
     MopSet,
@@ -164,7 +175,7 @@ from .tracker_components import (
 # =============================================================================
 # These caches are defined here to avoid circular imports. They were previously
 # in d810.optimizers.caching, but that module has IDA-specific imports that
-# create circular dependencies when d810.expr.p_ast tries to import them.
+# create circular dependencies when d810.hexrays.expr.p_ast tries to import them.
 
 
 @survives_reload(reload_key="_SHARED_MOP_CACHES")
@@ -204,6 +215,9 @@ __all__ = [
     "clear_logs",
     "LoggerConfigurator",
     "LevelFlag",
+    "SQLiteHandler",
+    "debug_scope",
+    "query_logs",
     # cache
     "Cache",
     "CacheImpl",
@@ -282,12 +296,6 @@ __all__ = [
     # MOP caches
     "MOP_CONSTANT_CACHE",
     "MOP_TO_AST_CACHE",
-    # merkle
-    "MerkleTree",
-    # patching
-    "PatchAction",
-    "PatchRecorder",
-    "BinaryPatcher",
     # ctree_snapshot
     "serialize_ctree",
     "deserialize_ctree",
@@ -302,7 +310,7 @@ __all__ = [
     "is_arch_specific_config",
     "resolve_arch_config",
     "ARCH_CONFIG_KEYS",
-    # tracker_components
+    # tracker
     "ImmutableBlockInfo",
     "CachedBlockPath",
     "MopSet",

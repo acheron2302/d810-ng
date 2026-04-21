@@ -23,21 +23,22 @@ import ida_hexrays
 
 from d810.core import getLogger
 from d810.core.bits import unsigned_to_signed
-from d810.hexrays.cfg_utils import (
-    make_2way_block_goto,
-    safe_verify,
-    update_blk_successor,
-)
-from d810.hexrays.deferred_modifier import DeferredGraphModifier
-from d810.hexrays.hexrays_formatters import dump_microcode_for_debug, format_minsn_t
-from d810.hexrays.tracker import MopTracker
-from d810.optimizers.microcode.flow.flattening.dispatcher_detection import (
+from d810.hexrays.mutation.cfg_mutations import (
+    make_2way_block_goto)
+from d810.hexrays.mutation.cfg_verify import (
+    safe_verify)
+from d810.hexrays.mutation.cfg_mutations import (
+    update_blk_successor)
+from d810.hexrays.mutation.deferred_modifier import DeferredGraphModifier
+from d810.hexrays.utils.hexrays_formatters import dump_microcode_for_debug, format_minsn_t
+from d810.evaluator.hexrays_microcode.tracker import MopTracker
+from d810.recon.flow.dispatcher_detection import (
     DispatcherCache,
     DispatcherType,
 )
 from d810.optimizers.microcode.flow.flattening.generic import GenericUnflatteningRule
 from d810.optimizers.microcode.flow.handler import FlowRulePriority
-from d810.optimizers.microcode.flow.flattening.utils import get_all_possibles_values
+from d810.evaluator.hexrays_microcode.tracker import get_all_possibles_values
 
 unflat_logger = getLogger("D810.unflat")
 
@@ -131,7 +132,7 @@ class PredecessorAnalysisCache:
         }
 
 
-# Global cache instance (shared across passes for performance)
+# Global cache instance (shared across transform for performance)
 _pred_analysis_cache = PredecessorAnalysisCache()
 
 
@@ -167,11 +168,26 @@ class FixPredecessorOfConditionalJumpBlock(GenericUnflatteningRule):
 
     Works for O-LLVM style control flow flattening.
 
+    Gate operation mode: ``GATE_ONLY``
+    -----------------------------------
+    Uses :meth:`FlowMaturityContext.evaluate_fix_predecessor_gate` in
+    :meth:`check_if_rule_should_be_used`.  Gate is always enforced (rule
+    skipped when ``allowed=False``), with no planner/strategy influence.
+
+    See :class:`~d810.core.gate_modes.GateOperationMode`.
+
     Architecture:
     Uses deferred modification pattern:
     1. analyze_blk() queues all needed modifications (stores only serials)
     2. _apply_queued_modifications() applies them after analysis completes
     3. No live pointers stored across CFG modifications
+
+    Gate policy — AUDIT_ONLY (targeted rule, no bulk safeguard):
+    This is a per-block targeted rule, NOT a bulk CFG reconstruction pass.
+    The ``should_apply_bulk_cfg_modifications`` bulk safeguard is intentionally
+    absent — it is designed for batch dispatcher rewrites and would be too
+    aggressive for small, targeted predecessor patches. This rule uses its
+    own structural gate via ``flow_context.evaluate_fix_predecessor_gate()``.
     """
 
     DESCRIPTION = "Detect if a predecessor of a conditional block always takes the same path and patch it (works for O-LLVM style control flow flattening)"
@@ -201,7 +217,7 @@ class FixPredecessorOfConditionalJumpBlock(GenericUnflatteningRule):
         if blk.serial in self._state_var_repr_cache:
             return self._state_var_repr_cache[blk.serial]
 
-        from d810.hexrays.hexrays_formatters import format_mop_t
+        from d810.hexrays.utils.hexrays_formatters import format_mop_t
         rep = format_mop_t(blk.tail.l)
         self._state_var_repr_cache[blk.serial] = rep
         return rep
@@ -344,7 +360,7 @@ class FixPredecessorOfConditionalJumpBlock(GenericUnflatteningRule):
         )
 
         # Lazy logging - only format if enabled
-        if unflat_logger.isEnabledFor(20):  # INFO level
+        if unflat_logger.info_on:
             unflat_logger.info(
                 "Pred %d has %d possible paths (%d different cst): %s",
                 pred_serial, len(values), len(set(values)), values
@@ -376,7 +392,7 @@ class FixPredecessorOfConditionalJumpBlock(GenericUnflatteningRule):
         analysis = self._get_dispatcher_analysis(blk)
 
         if analysis.dispatcher_type == DispatcherType.CONDITIONAL_CHAIN:
-            if unflat_logger.isEnabledFor(10):  # DEBUG level
+            if unflat_logger.debug_on:
                 unflat_logger.debug(
                     "CONDITIONAL_CHAIN dispatcher detected - using dispatcher_info=None "
                     "to prevent cascading unreachability"
@@ -400,7 +416,7 @@ class FixPredecessorOfConditionalJumpBlock(GenericUnflatteningRule):
 
             if is_jmp_always_taken and is_jmp_never_taken:
                 # Should never happen
-                if unflat_logger.isEnabledFor(40):  # ERROR level
+                if unflat_logger.error_on:
                     unflat_logger.error(
                         "Logic error: '%s' is always taken and never taken from %d: %s",
                         format_minsn_t(blk.tail), pred_serial, pred_values
@@ -409,7 +425,7 @@ class FixPredecessorOfConditionalJumpBlock(GenericUnflatteningRule):
                 continue
 
             if is_jmp_always_taken:
-                if unflat_logger.isEnabledFor(20):  # INFO level
+                if unflat_logger.info_on:
                     unflat_logger.info(
                         "Jump '%s' always taken from pred %d: %s",
                         format_minsn_t(blk.tail), pred_serial, pred_values
@@ -417,7 +433,7 @@ class FixPredecessorOfConditionalJumpBlock(GenericUnflatteningRule):
                 pred_jmp_always_taken.append(pred_blk)
 
             if is_jmp_never_taken:
-                if unflat_logger.isEnabledFor(20):  # INFO level
+                if unflat_logger.info_on:
                     unflat_logger.info(
                         "Jump '%s' never taken from pred %d: %s",
                         format_minsn_t(blk.tail), pred_serial, pred_values
@@ -452,7 +468,7 @@ class FixPredecessorOfConditionalJumpBlock(GenericUnflatteningRule):
         # NOTE: For CONDITIONAL_CHAIN dispatchers (nested jnz/jz comparisons),
         # this rule uses dispatcher_info=None to avoid cascading unreachability.
         # See sort_predecessors() for details on why this is necessary.
-        if unflat_logger.isEnabledFor(20):  # INFO level
+        if unflat_logger.info_on:
             unflat_logger.info(
                 "Checking if block %d can be simplified: %s",
                 blk.serial, format_minsn_t(blk.tail)
@@ -462,7 +478,7 @@ class FixPredecessorOfConditionalJumpBlock(GenericUnflatteningRule):
             self.sort_predecessors(blk)
         )
 
-        if unflat_logger.isEnabledFor(20):  # INFO level
+        if unflat_logger.info_on:
             unflat_logger.info(
                 "Block %d has %d preds: %d always jmp, %d never jmp, %d unk",
                 blk.serial, blk.npred(),
@@ -485,7 +501,7 @@ class FixPredecessorOfConditionalJumpBlock(GenericUnflatteningRule):
             ))
             nb_queued += 1
 
-            if unflat_logger.isEnabledFor(10):  # DEBUG level
+            if unflat_logger.debug_on:
                 unflat_logger.debug(
                     "Queued ALWAYS_TAKEN: pred %d -> cond block %d -> target %d",
                     pred_blk.serial, blk.serial, blk.tail.d.b
@@ -503,7 +519,7 @@ class FixPredecessorOfConditionalJumpBlock(GenericUnflatteningRule):
             ))
             nb_queued += 1
 
-            if unflat_logger.isEnabledFor(10):  # DEBUG level
+            if unflat_logger.debug_on:
                 unflat_logger.debug(
                     "Queued NEVER_TAKEN: pred %d -> cond block %d -> fallthrough %d",
                     pred_blk.serial, blk.serial, blk.nextb.serial
@@ -521,7 +537,7 @@ class FixPredecessorOfConditionalJumpBlock(GenericUnflatteningRule):
 
         self._critical_apply_failure = False
 
-        if unflat_logger.isEnabledFor(20):  # INFO level
+        if unflat_logger.info_on:
             unflat_logger.info(
                 "Applying %d queued predecessor modifications",
                 len(self._pending_modifications)
@@ -575,7 +591,7 @@ class FixPredecessorOfConditionalJumpBlock(GenericUnflatteningRule):
         # Clear pending modifications after applying
         self._pending_modifications.clear()
 
-        if unflat_logger.isEnabledFor(20):  # INFO level
+        if unflat_logger.info_on:
             unflat_logger.info(
                 "Applied %d predecessor modifications successfully",
                 applied_count
@@ -693,7 +709,7 @@ class FixPredecessorOfConditionalJumpBlock(GenericUnflatteningRule):
             )
             return False
 
-        if unflat_logger.isEnabledFor(10):  # DEBUG level
+        if unflat_logger.debug_on:
             unflat_logger.debug(
                 "Applying modification: %s (pred %d -> cond %d -> target %d)",
                 mod.mod_type.name, mod.pred_serial,
@@ -742,7 +758,7 @@ class FixPredecessorOfConditionalJumpBlock(GenericUnflatteningRule):
                 self._orphan_block(new_jmp_block, "update_blk_successor failure")
                 return False
 
-            if unflat_logger.isEnabledFor(10):  # DEBUG level
+            if unflat_logger.debug_on:
                 unflat_logger.debug(
                     "Successfully applied: created block %d, redirected pred %d",
                     new_jmp_block.serial, mod.pred_serial
@@ -786,6 +802,19 @@ class FixPredecessorOfConditionalJumpBlock(GenericUnflatteningRule):
         if nb_queued == 0:
             return 0
 
+        # NOTE: No bulk-CFG safeguard here. FixPredecessor makes targeted
+        # per-block edge redirects (not bulk CFG rewrites like Hodur).
+        # It already has two safety gates:
+        #   1. flow_context.evaluate_fix_predecessor_gate() in check_if_rule_should_be_used
+        #   2. Per-block structural checks (tail opcode, maturity, max passes)
+        # should_apply_bulk_cfg_modifications is too aggressive for small dispatchers
+        # like abc_xor_dispatch where resolving 1-2 predecessors IS the solution.
+        # G2: audit trail via structured logging only.
+        unflat_logger.info(
+            "fix_pred gate: applying %d modifications for block %d",
+            nb_queued, blk.serial,
+        )
+
         # Phase 2: Apply - execute all modifications
         self.last_pass_nb_patch_done = self._apply_queued_modifications()
 
@@ -827,10 +856,21 @@ class FixPredecessorOfConditionalJumpBlock(GenericUnflatteningRule):
             self._verify_failed = False  # Reset on maturity change
 
         if self.cur_maturity not in self.maturities:
+            # Gate: maturity filter — normal operation, not a bypass.
+            if unflat_logger.debug_on:
+                unflat_logger.debug(
+                    "Gate skipped [maturity_filter]: %s at maturity %d not in %s",
+                    self.__class__.__name__,
+                    self.cur_maturity,
+                    self.maturities,
+                )
             return False
 
         if self.flow_context is not None:
             gate = self.flow_context.evaluate_fix_predecessor_gate()
+            # Record flow gate outcome
+            if hasattr(self.flow_context, 'report_outcome'):
+                self.flow_context.report_outcome(gate, "fixpred_gate")
             if not gate.allowed:
                 unflat_logger.debug(
                     "Skipping %s via flow context gate: %s",
@@ -840,6 +880,14 @@ class FixPredecessorOfConditionalJumpBlock(GenericUnflatteningRule):
                 return False
 
         if self.DEFAULT_MAX_PASSES is not None and self.cur_maturity_pass >= self.DEFAULT_MAX_PASSES:
+            # Gate: max passes reached.
+            if unflat_logger.debug_on:
+                unflat_logger.debug(
+                    "Gate skipped [max_passes]: %s pass %d >= %d",
+                    self.__class__.__name__,
+                    self.cur_maturity_pass,
+                    self.DEFAULT_MAX_PASSES,
+                )
             return False
 
         if blk.tail is None or blk.tail.opcode not in JMP_OPCODE_HANDLED:

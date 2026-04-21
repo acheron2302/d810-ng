@@ -1,8 +1,10 @@
 import ida_hexrays
 
+from d810.evaluator.evaluators import evaluate_concrete
 from d810.core.bits import unsigned_to_signed
-from d810.expr.ast import AstConstant, AstLeaf, AstNode, mop_to_ast
-from d810.expr.z3_utils import z3_check_mop_equality, z3_check_mop_inequality
+from d810.hexrays.expr.ast import AstConstant, AstLeaf, AstNode
+from d810.hexrays.ir.mop_utils import mop_to_ast
+from d810.backends.ast.z3 import Z3MopProver
 from d810.optimizers.microcode.flow.jumps.handler import JumpOptimizationRule
 
 
@@ -50,9 +52,19 @@ def _eval_constant_mop(mop) -> int | None:
     if ast is None or not _is_constant_ast(ast):
         return None
     try:
-        return int(ast.evaluate({}))
+        result = evaluate_concrete(ast, {})
     except Exception:
-        return None
+        result = None
+
+    # Compatibility path for non-d810 test stubs that only provide an
+    # evaluate(dict) method. Real ASTs should be handled by evaluate_concrete.
+    if result is None and hasattr(ast, "evaluate"):
+        try:
+            result = ast.evaluate({})
+        except Exception:
+            return None
+
+    return int(result) if result is not None else None
 
 
 def _constant_relation(left_mop, right_mop) -> bool | None:
@@ -305,8 +317,8 @@ class JnzRuleModIdentity(JumpOptimizationRule):
     def check_candidate(self, opcode, left_candidate, right_candidate):
         # x*(x+1) % 2 == 0 is ALWAYS true (left operand always equals right operand 0).
         # Condition: left == right is TRUE
-        # - m_jnz (jump if NOT equal): condition FALSE → jump NOT taken → fallthrough (direct_block_serial)
-        # - m_jz (jump if equal): condition TRUE → jump taken → go to jump_original_block_serial
+        # - m_jnz (jump if NOT equal): condition FALSE -> jump NOT taken -> fallthrough (direct_block_serial)
+        # - m_jz (jump if equal): condition TRUE -> jump taken -> go to jump_original_block_serial
         if opcode == ida_hexrays.m_jnz:
             self.jump_replacement_block_serial = self.direct_block_serial
         else:
@@ -347,7 +359,7 @@ class JmpRuleZ3Const(JumpOptimizationRule):
         return super().check_pattern_and_replace(blk, instruction, left_ast, right_ast)
 
     def check_candidate(self, opcode, left_candidate, right_candidate):
-        if opcode in (ida_hexrays.m_jnz, ida_hexrays.m_jz) and z3_check_mop_equality(
+        if opcode in (ida_hexrays.m_jnz, ida_hexrays.m_jz) and Z3MopProver().are_equal(
             left_candidate.mop, right_candidate.mop
         ):
             self.jump_replacement_block_serial = _target_for_relation(
@@ -357,7 +369,7 @@ class JmpRuleZ3Const(JumpOptimizationRule):
                 fallthrough_target=self.direct_block_serial,
             )
             return True
-        if opcode in (ida_hexrays.m_jnz, ida_hexrays.m_jz) and z3_check_mop_inequality(
+        if opcode in (ida_hexrays.m_jnz, ida_hexrays.m_jz) and Z3MopProver().are_unequal(
             left_candidate.mop, right_candidate.mop
         ):
             self.jump_replacement_block_serial = _target_for_relation(

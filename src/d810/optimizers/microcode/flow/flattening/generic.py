@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import abc
 import os
+from collections import Counter
 from d810.core.typing import Any
 
 import idaapi
@@ -32,59 +33,75 @@ import ida_hexrays
 import idc
 
 from d810.core import getLogger
-from d810.expr.emulator import MicroCodeEnvironment, MicroCodeInterpreter
-from d810.hexrays.cfg_utils import (
-    change_1way_block_successor,
-    create_block,
-    ensure_child_has_an_unconditional_father,
-    ensure_last_block_is_goto,
-    mba_deep_cleaning,
-    safe_verify,
+from d810.evaluator.hexrays_microcode.emulator import (
+    MicroCodeEnvironment,
+    MicroCodeInterpreter,
 )
-from d810.hexrays.hexrays_formatters import (
+from d810.hexrays.mutation.cfg_mutations import create_standalone_block, insert_goto_instruction
+from d810.hexrays.ir.cfg_queries import _serial_in_predset
+from d810.hexrays.mutation.cfg_mutations import (
+    change_1way_block_successor)
+from d810.hexrays.mutation.cfg_mutations import (
+    coalesce_jtbl_cases)
+from d810.hexrays.mutation.cfg_mutations import (
+    create_block)
+from d810.hexrays.mutation.cfg_mutations import (
+    downgrade_nway_null_tail_to_1way)
+from d810.hexrays.mutation.cfg_mutations import (
+    ensure_child_has_an_unconditional_father)
+from d810.hexrays.mutation.cfg_mutations import (
+    ensure_last_block_is_goto)
+from d810.hexrays.mutation.cfg_mutations import (
+    mba_deep_cleaning)
+from d810.hexrays.mutation.cfg_mutations import (
+    retarget_jtbl_block_cases)
+from d810.hexrays.mutation.cfg_verify import (
+    safe_verify)
+from d810.hexrays.utils.hexrays_formatters import (
     dump_microcode_for_debug,
     format_minsn_t,
     format_mop_list,
     format_mop_t,
 )
-from d810.hexrays.hexrays_helpers import (
+from d810.hexrays.utils.hexrays_helpers import (
     CONDITIONAL_JUMP_OPCODES,
     CONTROL_FLOW_OPCODES,
     append_mop_if_not_in_list,
     extract_num_mop,
     get_mop_index,
 )
-from d810.hexrays.tracker import (
+from d810.evaluator.hexrays_microcode.tracker import (
     InstructionDefUseCollector,
     MopHistory,
     MopTracker,
+    check_if_all_values_are_found,
     duplicate_histories,
+    get_all_possibles_values,
     remove_segment_registers,
 )
-from d810.optimizers.microcode.flow.flattening.utils import (
+from d810.optimizers.microcode.flow.flattening.exceptions import (
     NotDuplicableFatherException,
     NotResolvableFatherException,
-    check_if_all_values_are_found,
-    get_all_possibles_values,
 )
 from d810.core.registry import EventEmitter
-from d810.hexrays.deferred_modifier import DeferredGraphModifier, GraphModification
+from d810.hexrays.mutation.deferred_events import DeferredEvent, EventEmitter as DeferredEventEmitter
+from d810.hexrays.mutation.deferred_modifier import DeferredGraphModifier, GraphModification
 from d810.optimizers.microcode.flow.flattening.abc_block_splitter import (
     ABCBlockSplitter,
     ConditionalStateResolver,
 )
-from d810.optimizers.microcode.flow.flattening.conditional_exit import (
+from d810.recon.flow.conditional_exit import (
     classify_exit_block,
     ExitBlockType,
     get_loopback_successor,
     get_exit_successor,
-    resolve_loopback_target,
 )
-from d810.optimizers.microcode.flow.flattening.loop_prover import (
+from d810.hexrays.ir.conditional_exit import resolve_loopback_target
+from d810.recon.flow.loop_prover import (
     SingleIterationLoopTracker,
     prove_single_iteration,
 )
-from d810.optimizers.microcode.flow.flattening.safeguards import should_apply_cfg_modifications
+from d810.optimizers.microcode.flow.flattening.safeguards import should_apply_bulk_cfg_modifications
 from d810.optimizers.microcode.handler import ConfigParam
 from d810.optimizers.microcode.flow.handler import FlowOptimizationRule, FlowRulePriority
 
@@ -99,20 +116,20 @@ class UnflatteningEvent:
     ----
     ::
 
-        MMAT_CALLS → optimize()
-            ├── _apply_scheduled_modifications()  # Apply anything queued for MMAT_CALLS
-            └── ... normal processing ...
-                 └── schedule_for_maturity(MMAT_GLBOPT1, mod)  # Queue cleanup
+        MMAT_CALLS -> optimize()
+            |-- _apply_scheduled_modifications()  # Apply anything queued for MMAT_CALLS
+            `-- ... normal processing ...
+                 `-- schedule_for_maturity(MMAT_GLBOPT1, mod)  # Queue cleanup
 
-        MMAT_GLBOPT1 → optimize()
-            ├── _apply_scheduled_modifications()  # Applies the queued mod
-            └── ... normal processing ...
+        MMAT_GLBOPT1 -> optimize()
+            |-- _apply_scheduled_modifications()  # Applies the queued mod
+            `-- ... normal processing ...
 
     Example: Scheduling modifications for a future maturity
     -------------------------------------------------------
     ::
 
-        from d810.hexrays.deferred_modifier import GraphModification, ModificationType
+        from d810.hexrays.mutation.deferred_modifier import GraphModification, ModificationType
 
         # During MMAT_CALLS, schedule cleanup for GLBOPT1
         mod = GraphModification(
@@ -548,6 +565,17 @@ class GenericDispatcherCollector(ida_hexrays.minsn_visitor_t):
 
 
 class GenericUnflatteningRule(FlowOptimizationRule):
+    """Base class for O-LLVM-style dispatcher unflattening rules.
+
+    Gate operation mode: ``GATE_ONLY``
+    -----------------------------------
+    Uses :meth:`FlowMaturityContext.evaluate_unflattening_gate` in
+    :meth:`check_if_rule_should_be_used`.  Gate is enforced (rule skipped
+    when ``allowed=False``), but results do not feed into planner/strategy
+    selection.
+
+    See :class:`~d810.core.gate_modes.GateOperationMode`.
+    """
 
     CATEGORY = "OLLVM Unflattening"
     PRIORITY = FlowRulePriority.UNFLATTEN
@@ -556,7 +584,10 @@ class GenericUnflatteningRule(FlowOptimizationRule):
     # Practical maturities - MMAT_GLBOPT3 is rarely/never called by Hex-Rays.
     # Keep unflattening out of MMAT_CALLS by default because large CFG rewrite
     # batches at that maturity are the most crash-prone in practice.
+    # MMAT_LOCOPT (3) is included because optblock_t callbacks fire here; without
+    # it the rule scope service filters the unflattener out at that maturity.
     DEFAULT_UNFLATTENING_MATURITIES = [
+        ida_hexrays.MMAT_LOCOPT,
         ida_hexrays.MMAT_GLBOPT1,
         ida_hexrays.MMAT_GLBOPT2,
     ]
@@ -772,16 +803,32 @@ class GenericUnflatteningRule(FlowOptimizationRule):
             self.cur_maturity = self.mba.maturity
             self.cur_maturity_pass = 0
         if self.cur_maturity not in self.maturities:
-            return False
-        if self.flow_context is not None:
-            gate = self.flow_context.evaluate_unflattening_gate()
-            if not gate.allowed:
+            # Gate: maturity filter — normal operation, not a bypass.
+            if unflat_logger.debug_on:
                 unflat_logger.debug(
-                    "Skipping %s via flow context gate: %s",
+                    "Gate skipped [maturity_filter]: %s at maturity %d not in %s",
                     self.__class__.__name__,
-                    gate.reason,
+                    self.cur_maturity,
+                    self.maturities,
                 )
-                return False
+            return False
+        # Rules with their own dispatcher collector (i.e. GenericDispatcherUnflatteningRule
+        # subclasses) perform their own structural detection and must not be pre-screened
+        # by the lightweight flow-context heuristic, which can produce false negatives for
+        # patterns like OLLVM whose CFG signatures differ from what the gate expects.
+        if not getattr(self, "HAS_OWN_DISPATCHER_COLLECTOR", False):
+            if self.flow_context is not None:
+                gate = self.flow_context.evaluate_unflattening_gate()
+                # Record flow gate outcome
+                if hasattr(self.flow_context, 'report_outcome'):
+                    self.flow_context.report_outcome(gate, "unflattening_gate")
+                if not gate.allowed:
+                    unflat_logger.debug(
+                        "Skipping %s via flow context gate: %s",
+                        self.__class__.__name__,
+                        gate.reason,
+                    )
+                    return False
         return True
 
     @abc.abstractmethod
@@ -791,6 +838,13 @@ class GenericUnflatteningRule(FlowOptimizationRule):
 
 
 class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
+    # Signals that this rule uses its own dispatcher collector for structural
+    # detection.  The flow-context pre-screening gate in
+    # GenericUnflatteningRule.check_if_rule_should_be_used() checks this flag
+    # and skips the lightweight heuristic for these rules so that patterns
+    # whose CFG signatures differ from the gate's expectations (e.g. OLLVM
+    # functions classified as UNKNOWN) are not incorrectly blocked.
+    HAS_OWN_DISPATCHER_COLLECTOR: bool = True
 
     CONFIG_SCHEMA = GenericUnflatteningRule.CONFIG_SCHEMA + (
         ConfigParam("max_passes", int, 5, "Maximum optimization passes"),
@@ -846,6 +900,12 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
             True,
             "Run safe_verify() after each pre-unflatten optimize_local() round",
         ),
+        ConfigParam(
+            "post_apply_const_prop",
+            bool,
+            False,
+            "Run ForwardConstantPropagationRule after each unflattening pass",
+        ),
     )
 
     MOP_TRACKER_MAX_NB_BLOCK = 100
@@ -893,9 +953,21 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
             self.DEFAULT_PRE_UNFLATTEN_OPTIMIZE_LOCAL_ROUNDS
         )
         self.pre_unflatten_verify = self.DEFAULT_PRE_UNFLATTEN_VERIFY
+        self.post_apply_const_prop = False
         self.non_significant_changes = 0
         # Track processed (source_block, target) pairs to prevent duplicates
         self._processed_dispatcher_fathers: set[tuple[int, int]] = set()
+        # Quarantine: function EAs where a deferred verify failure was observed.
+        # While quarantined, aggressive rewrites for that function/maturity are
+        # skipped to prevent compounding MBA corruption.
+        self._quarantined_function_eas: set[int] = set()
+        # Deferred event emitter shared with DeferredGraphModifier instances
+        # created by this rule, enabling lifecycle event subscriptions.
+        self.deferred_events: DeferredEventEmitter = DeferredEventEmitter()
+        self.deferred_events.subscribe(
+            DeferredEvent.DEFERRED_VERIFY_FAILED,
+            self._on_deferred_verify_failed,
+        )
         # Track deferred direct edge rewrites per dispatcher entry:
         # {dispatcher_entry_serial: {(source_serial, target_serial), ...}}
         # Used for post-apply jtbl overlap canonicalization.
@@ -903,6 +975,9 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
         # Set when deferred modifier verify fails -- prevents further
         # processing on a corrupted MBA that would cause IDA hangs.
         self._verify_failed: bool = False
+        # Track the last function EA seen in optimize() to detect new functions.
+        self._last_function_ea: int = -1
+        self._last_maturity: int = -1
         # Last collected dispatcher layout signals (for debug tooling/tests).
         self._last_layout_signals: dict[str, Any] = {}
 
@@ -912,19 +987,76 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
         """Return the class of the dispatcher collector."""
         raise NotImplementedError
 
+    def _on_deferred_verify_failed(self, payload: dict) -> None:
+        """Handle DEFERRED_VERIFY_FAILED events from a DeferredGraphModifier.
+
+        Sets a quarantine flag on the function identified in *payload* so that
+        further aggressive rewrites are skipped for the current maturity level.
+        The quarantine is keyed by function EA (an int), which is stable and
+        primitive -- no live IDA objects are stored.
+
+        Args:
+            payload: Event payload dict containing ``function_ea`` (int or None).
+        """
+        function_ea = payload.get("function_ea")
+        if isinstance(function_ea, int) and function_ea > 0:
+            self._quarantined_function_eas.add(function_ea)
+            unflat_logger.warning(
+                "Quarantining function 0x%x after deferred verify failure "
+                "(maturity=%s, optimizer=%s)",
+                function_ea,
+                payload.get("maturity"),
+                payload.get("optimizer_name", ""),
+            )
+
+    def _is_function_quarantined(self) -> bool:
+        """Return True if the current function is in the verify-failure quarantine.
+
+        Quarantined functions skip aggressive CFG rewrites within the current
+        maturity level to prevent compounding MBA corruption.
+        """
+        if not self._quarantined_function_eas:
+            return False
+        try:
+            func_ea = int(self.mba.entry_ea)
+        except Exception:
+            return False
+        return func_ea in self._quarantined_function_eas
+
     def check_if_rule_should_be_used(self, blk: ida_hexrays.mblock_t) -> bool:
         if self._verify_failed:
             unflat_logger.debug(
                 "Skipping rule -- MBA verify previously failed"
             )
             return False
+        if self._is_function_quarantined():
+            unflat_logger.debug(
+                "Skipping rule -- function 0x%x is quarantined after verify failure",
+                int(self.mba.entry_ea) if self.mba else 0,
+            )
+            return False
         if not super().check_if_rule_should_be_used(blk):
             return False
         if (self.cur_maturity_pass >= 1) and (self.last_pass_nb_patch_done == 0):
+            # Gate: convergence — no patches in previous pass.
+            if unflat_logger.debug_on:
+                unflat_logger.debug(
+                    "Gate skipped [convergence]: %s pass %d produced 0 patches",
+                    self.__class__.__name__,
+                    self.cur_maturity_pass - 1,
+                )
             return False
         if (self.max_passes is not None) and (
             self.cur_maturity_pass >= self.max_passes
         ):
+            # Gate: max passes reached.
+            if unflat_logger.debug_on:
+                unflat_logger.debug(
+                    "Gate skipped [max_passes]: %s pass %d >= %d",
+                    self.__class__.__name__,
+                    self.cur_maturity_pass,
+                    self.max_passes,
+                )
             return False
         return True
 
@@ -958,6 +1090,8 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
             )
         if "pre_unflatten_verify" in self.config.keys():
             self.pre_unflatten_verify = bool(self.config["pre_unflatten_verify"])
+        if "post_apply_const_prop" in self.config.keys():
+            self.post_apply_const_prop = bool(self.config["post_apply_const_prop"])
         self._snapshot_base_override_values()
         self.dispatcher_collector.configure(kwargs)
 
@@ -1239,6 +1373,23 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
                 nb_change += ensure_child_has_an_unconditional_father(
                     dispatcher_father, dispatcher_info.entry_block.blk, verify=False
                 )
+                # Handle degenerate BLT_NWAY blocks with null tail: these arise
+                # when all jtbl cases have been resolved but the block type was
+                # not updated, leaving type=BLT_NWAY, tail=None, nsucc==2.
+                # ensure_child_has_an_unconditional_father skips them (tail is None
+                # guard), so we fix them atomically here before INTERR 50860 fires.
+                if (
+                    dispatcher_father is not None
+                    and dispatcher_father.type == ida_hexrays.BLT_NWAY
+                    and dispatcher_father.tail is None
+                    and dispatcher_father.nsucc() == 2
+                ):
+                    if downgrade_nway_null_tail_to_1way(
+                        dispatcher_father,
+                        dispatcher_info.entry_block.blk.serial,
+                        verify=False,
+                    ):
+                        nb_change += 1
         return nb_change
 
     def ensure_dispatcher_fathers_are_direct(
@@ -1789,6 +1940,44 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
                 return True
         return False
 
+    def _has_cross_case_hazard(self) -> bool:
+        """Detect cross-case edges that crash IDA's structurer.
+
+        Returns True if any jtbl case target has a predecessor that is
+        also a case target of the same dispatcher (cross-case edge).
+        """
+        blt_nway = getattr(ida_hexrays, "BLT_NWAY", None)
+        for serial in range(self.mba.qty):
+            blk = self.mba.get_mblock(serial)
+            if blk is None:
+                continue
+            if blt_nway is not None and blk.type != blt_nway:
+                continue
+            tail = blk.tail
+            if tail is None or tail.opcode != ida_hexrays.m_jtbl:
+                continue
+            if tail.r is None or tail.r.t != ida_hexrays.mop_c or tail.r.c is None:
+                continue
+            cases = tail.r.c
+            if cases is None:
+                continue
+            case_targets: set[int] = set()
+            for i in range(cases.targets.size()):
+                case_targets.add(int(cases.targets[i]))
+            # Check if any case target has a non-dispatcher predecessor
+            # that is also a case target
+            for tgt in case_targets:
+                tgt_blk = self.mba.get_mblock(tgt)
+                if tgt_blk is None:
+                    continue
+                for pred in tgt_blk.predset:
+                    p = int(pred)
+                    if p == serial:  # dispatcher predecessor is expected
+                        continue
+                    if p in case_targets:
+                        return True
+        return False
+
     def _canonicalize_jtbl_cross_case_overlaps(self) -> int:
         """Retarget overlapping jtbl entries to avoid shared case-entry headers.
 
@@ -1820,16 +2009,18 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
                 continue
 
             old_target_set: set[int] = set()
-            target_to_indices: dict[int, list[int]] = {}
             for i in range(targets.size()):
                 target_serial = int(targets[i])
                 old_target_set.add(target_serial)
-                target_to_indices.setdefault(target_serial, []).append(i)
             if not old_target_set:
                 continue
 
-            dispatcher_changed = False
             case_targets = set(old_target_set)
+
+            # Pass 1: build retarget_map from the original targets[] state.
+            # Do NOT mutate targets[] here — compute all (old -> new) mappings
+            # first so that no entry depends on a previously mutated value.
+            retarget_map: dict[int, int] = {}
             for target_serial in sorted(old_target_set):
                 target_blk = self.mba.get_mblock(target_serial)
                 if target_blk is None:
@@ -1841,6 +2032,33 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
                     if pred_serial_int in (dispatcher_serial, target_serial):
                         continue
                     if pred_serial_int not in case_targets:
+                        # Single-hop transitive check: pred is an intermediate
+                        # block (e.g. a trampoline) that is NOT itself a jtbl
+                        # case target.  If one of ITS predecessors IS a case
+                        # target and the recorded rewrite_edges says that case
+                        # pred was redirected toward target_serial, treat the
+                        # case pred as the overlap representative.
+                        pred_blk = self.mba.get_mblock(pred_serial_int)
+                        if pred_blk is None:
+                            continue
+                        if not self._serial_in_set(pred_blk.succset, target_serial):
+                            continue
+                        for pp_serial in pred_blk.predset:
+                            pp_serial_int = int(pp_serial)
+                            if pp_serial_int in (dispatcher_serial, target_serial):
+                                continue
+                            if pp_serial_int not in case_targets:
+                                continue
+                            if (pp_serial_int, target_serial) not in rewrite_edges:
+                                continue
+                            pp_blk = self.mba.get_mblock(pp_serial_int)
+                            if pp_blk is None:
+                                continue
+                            if not self._serial_in_set(pp_blk.succset, pred_serial_int):
+                                continue
+                            # pp is a case target that reaches target via
+                            # intermediate pred -- treat pp as the overlap pred.
+                            overlap_preds.append(pp_serial_int)
                         continue
                     pred_blk = self.mba.get_mblock(pred_serial_int)
                     if pred_blk is None:
@@ -1862,56 +2080,141 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
                     continue
 
                 chosen_pred = min(rewritten_overlap_preds)
-                rewired_count = 0
-                for idx in target_to_indices.get(target_serial, []):
-                    if int(targets[idx]) == chosen_pred:
-                        continue
-                    targets[idx] = chosen_pred
-                    rewired_count += 1
 
-                if rewired_count == 0:
+                # Validate the overlap edge is still live in the
+                # post-modification CFG before committing the retarget.
+                # Deferred goto retargets may have rewired the graph such that
+                # chosen_pred no longer reaches target_serial, or such that
+                # retargeting the jtbl entry would create a cycle.
+                chosen_pred_blk = self.mba.get_mblock(chosen_pred)
+                if chosen_pred_blk is None:
+                    unflat_logger.info(
+                        "Skipping stale jtbl overlap in dispatcher %d: "
+                        "chosen_pred %d no longer exists",
+                        dispatcher_serial,
+                        chosen_pred,
+                    )
+                    continue
+                if not self._serial_in_set(chosen_pred_blk.succset, target_serial):
+                    unflat_logger.info(
+                        "Skipping stale jtbl overlap in dispatcher %d: "
+                        "chosen_pred %d is no longer a predecessor of target %d "
+                        "(stale edge from pre-modification analysis)",
+                        dispatcher_serial,
+                        chosen_pred,
+                        target_serial,
+                    )
+                    continue
+                # Cycle guard: if chosen_pred is already a successor of
+                # target_serial, retargeting jtbl→chosen_pred would create a
+                # back-edge and a cycle (e.g. 144↔145).
+                target_blk_check = self.mba.get_mblock(target_serial)
+                if target_blk_check is not None and self._serial_in_set(
+                    target_blk_check.succset, chosen_pred
+                ):
+                    unflat_logger.info(
+                        "Skipping jtbl overlap retarget in dispatcher %d: "
+                        "retargeting %d -> %d would create a cycle "
+                        "(target already reaches chosen_pred)",
+                        dispatcher_serial,
+                        target_serial,
+                        chosen_pred,
+                    )
                     continue
 
-                dispatcher_changed = True
-                total_case_retargets += rewired_count
+                retarget_map[target_serial] = chosen_pred
                 unflat_logger.warning(
                     "Canonicalized jtbl overlap in dispatcher %d: "
-                    "retargeted %d case(s) %d -> %d (overlap_preds=%s)",
+                    "will retarget case(s) %d -> %d (overlap_preds=%s)",
                     dispatcher_serial,
-                    rewired_count,
                     target_serial,
                     chosen_pred,
                     sorted(overlap_preds),
                 )
 
-            if not dispatcher_changed:
+            # Pass 1b: resolve transitive chains in retarget_map.
+            # If retarget_map has {9:8, 8:7}, applying both creates a jtbl
+            # entry pointing to 8 that is no longer the canonical entry (since
+            # 8 itself is retargeted to 7). IDA's verify sees block 8 reachable
+            # from two different paths and flags a dominator cycle (INTERR 50753).
+            # Collapse chains so each entry maps directly to its chain root.
+            for key in list(retarget_map.keys()):
+                visited: set[int] = {key}
+                cur = retarget_map[key]
+                while cur in retarget_map:
+                    nxt = retarget_map[cur]
+                    if nxt in visited:
+                        # Detected a cycle in the retarget_map itself — skip.
+                        unflat_logger.info(
+                            "Skipping jtbl overlap retarget in dispatcher %d: "
+                            "transitive chain from %d reached cycle at %d",
+                            dispatcher_serial,
+                            key,
+                            nxt,
+                        )
+                        cur = key  # signal: leave this entry unchanged
+                        break
+                    visited.add(cur)
+                    cur = nxt
+                if cur != key:
+                    retarget_map[key] = cur
+
+            # ── Pass 1c: insert trampolines for would-be-duplicate destinations ──
+            # After retargeting, the final target set is:
+            #   (old_target_set - retarget_map.keys()) | retarget_map.values()
+            # If any retarget destination is in the non-retargeted remainder OR
+            # appears multiple times as a value, duplicate targets would trigger
+            # INTERR 50753. We break duplicates by inserting a goto-only
+            # trampoline block per destination.
+            final_kept = old_target_set - set(retarget_map.keys())
+            dest_counts: Counter[int] = Counter(retarget_map.values())
+            trampoline_cache: dict[int, int] = {}  # real_dest → trampoline serial
+
+            for key in list(retarget_map.keys()):
+                dest = retarget_map[key]
+                needs_trampoline = dest in final_kept or dest_counts[dest] > 1
+                if not needs_trampoline:
+                    continue
+                if dest not in trampoline_cache:
+                    tramp = create_standalone_block(
+                        ref_blk=self.mba.get_mblock(dispatcher_serial),
+                        blk_ins=[],
+                        target_serial=dest,
+                        verify=False,
+                    )
+                    trampoline_cache[dest] = tramp.serial
+                    unflat_logger.debug(
+                        "jtbl canon: created trampoline blk %d -> %d to avoid duplicate target",
+                        tramp.serial,
+                        dest,
+                    )
+                retarget_map[key] = trampoline_cache[dest]
+
+            if trampoline_cache:
+                # Re-fetch dispatcher_blk after MBA reallocation caused by
+                # copy_block inside create_standalone_block.
+                dispatcher_blk = self.mba.get_mblock(dispatcher_serial)
+
+            # Pass 2: execute retarget + succ/pred sync via
+            # the central CFG mutation gateway.
+            retargeted_cases = retarget_jtbl_block_cases(
+                dispatcher_blk,
+                retarget_map,
+                deduplicate=False,
+            )
+            # Always coalesce duplicate jtbl targets on the dispatcher block,
+            # including pre-existing duplicates introduced by the unflattener
+            # that were never retargeted (would cause INTERR 50753).
+            coalesced = coalesce_jtbl_cases(dispatcher_blk)
+            if coalesced > 0:
+                unflat_logger.debug(
+                    "jtbl canon: coalesced %d pre-existing duplicate targets on blk %d",
+                    coalesced,
+                    dispatcher_serial,
+                )
+            if retargeted_cases <= 0 and coalesced <= 0:
                 continue
-
-            new_target_set = set(int(targets[i]) for i in range(targets.size()))
-
-            removed_targets = sorted(old_target_set - new_target_set)
-            for removed_target in removed_targets:
-                if self._serial_in_set(dispatcher_blk.succset, removed_target):
-                    dispatcher_blk.succset._del(removed_target)
-                removed_blk = self.mba.get_mblock(removed_target)
-                if removed_blk is not None and self._serial_in_set(
-                    removed_blk.predset, dispatcher_serial
-                ):
-                    removed_blk.predset._del(dispatcher_serial)
-                    removed_blk.mark_lists_dirty()
-
-            added_targets = sorted(new_target_set - old_target_set)
-            for added_target in added_targets:
-                if not self._serial_in_set(dispatcher_blk.succset, added_target):
-                    dispatcher_blk.succset.push_back(added_target)
-                added_blk = self.mba.get_mblock(added_target)
-                if added_blk is not None and not self._serial_in_set(
-                    added_blk.predset, dispatcher_serial
-                ):
-                    added_blk.predset.push_back(dispatcher_serial)
-                    added_blk.mark_lists_dirty()
-
-            dispatcher_blk.mark_lists_dirty()
+            total_case_retargets += retargeted_cases
 
         if total_case_retargets > 0:
             self.mba.mark_chains_dirty()
@@ -1992,15 +2295,15 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
         self,
         dispatcher_father: ida_hexrays.mblock_t,
         dispatcher_info: GenericDispatcherInfo,
-        deferred_modifier: DeferredGraphModifier | None = None,
+        deferred_modifier: DeferredGraphModifier,
     ) -> int:
         """Resolve a dispatcher father block by redirecting it to the target.
 
         Args:
             dispatcher_father: The predecessor block to resolve
             dispatcher_info: Information about the dispatcher
-            deferred_modifier: If provided, queue CFG modifications instead of
-                applying them directly. This enables safer deferred patching.
+            deferred_modifier: Queue CFG modifications instead of applying them
+                directly. This enables safer deferred patching.
 
         Returns:
             2 on success (for historical reasons)
@@ -2154,7 +2457,7 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
             exit_type = classify_exit_block(dispatcher_father, dispatcher_blk_serials_set)
 
             # Handle conditional exit blocks (one path loops back, one exits)
-            if exit_type == ExitBlockType.CONDITIONAL_EXIT_WITH_LOOPBACK and deferred_modifier is not None:
+            if exit_type == ExitBlockType.CONDITIONAL_EXIT_WITH_LOOPBACK:
                 loopback_serial = get_loopback_successor(dispatcher_father, dispatcher_blk_serials_set)
                 exit_serial = get_exit_successor(dispatcher_father, dispatcher_blk_serials_set)
 
@@ -2200,212 +2503,186 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
                         dispatcher_father.serial
                     )
 
-            if deferred_modifier is not None:
-                queued_change = False
-                source_nsucc = dispatcher_father.nsucc()
-                tail_opcode = dispatcher_father.tail.opcode if dispatcher_father.tail else None
-                copy_insns = ins_to_copy
+            queued_change = False
+            source_nsucc = dispatcher_father.nsucc()
+            tail_opcode = dispatcher_father.tail.opcode if dispatcher_father.tail else None
+            copy_insns = ins_to_copy
 
-                # Use deferred CFG modifications
-                if len(copy_insns) > 0:
-                    if source_nsucc != 1:
-                        # create_and_redirect rewires a single outgoing edge.
-                        # Skip non-1way sources to avoid queuing invalid edits
-                        # that fail deferred apply and poison the pass.
-                        unflat_logger.warning(
-                            "Skipping create_and_redirect for non-1way father blk %d "
-                            "(nsucc=%d) toward blk %d",
-                            dispatcher_father.serial,
-                            source_nsucc,
-                            target_blk.serial,
-                        )
-                    else:
-                        unflat_logger.info(
-                            "Queuing create_and_redirect: %s instructions from block %s -> %s",
-                            len(copy_insns),
-                            dispatcher_father.serial,
-                            target_blk.serial,
-                        )
-                        deferred_modifier.queue_create_and_redirect(
-                            source_block_serial=dispatcher_father.serial,
-                            final_target_serial=target_blk.serial,
-                            instructions_to_copy=copy_insns,
-                            is_0_way=(target_blk.type == ida_hexrays.BLT_0WAY),
-                            description=f"resolve_dispatcher_father {dispatcher_father.serial} -> {target_blk.serial}",
-                        )
-                        queued_change = True
+            # Use deferred CFG modifications
+            if len(copy_insns) > 0:
+                if source_nsucc != 1:
+                    # create_and_redirect rewires a single outgoing edge.
+                    # Skip non-1way sources to avoid queuing invalid edits
+                    # that fail deferred apply and poison the pass.
+                    unflat_logger.warning(
+                        "Skipping create_and_redirect for non-1way father blk %d "
+                        "(nsucc=%d) toward blk %d",
+                        dispatcher_father.serial,
+                        source_nsucc,
+                        target_blk.serial,
+                    )
                 else:
-                    if source_nsucc == 1:
-                        clone_conditional_targets = (
-                            os.environ.get("D810_UNFLAT_CLONE_COND_TARGET", "").strip().lower()
-                            in ("1", "true", "yes", "on")
-                        )
-                        # When the resolved target is itself a conditional 2-way
-                        # block, redirecting many new predecessors directly into
-                        # that shared block can produce unstable CFGs for some
-                        # large flattened functions (AntiDebug case). Instead,
-                        # clone the conditional shape and redirect the father to
-                        # the clone, following the same proven pattern used by
-                        # FixPredecessorOfConditionalJumpBlock.
-                        target_is_conditional = (
-                            target_blk.nsucc() == 2
-                            and target_blk.tail is not None
-                            and ida_hexrays.is_mcode_jcond(target_blk.tail.opcode)
-                            and target_blk.nextb is not None
-                        )
-                        if target_is_conditional and clone_conditional_targets:
-                            cond_target_serial = int(target_blk.tail.d.b)
-                            fallthrough_target_serial = int(target_blk.nextb.serial)
-                            unflat_logger.info(
-                                "Queuing conditional redirect clone: father %s via ref %s "
-                                "(jcc->%s, fallthrough->%s)",
-                                dispatcher_father.serial,
-                                target_blk.serial,
-                                cond_target_serial,
-                                fallthrough_target_serial,
-                            )
-                            deferred_modifier.queue_create_conditional_redirect(
-                                source_blk_serial=dispatcher_father.serial,
-                                ref_blk_serial=target_blk.serial,
-                                conditional_target_serial=cond_target_serial,
-                                fallthrough_target_serial=fallthrough_target_serial,
-                                description=(
-                                    "resolve_dispatcher_father(cond-clone) "
-                                    f"{dispatcher_father.serial} -> ref {target_blk.serial} "
-                                    f"(jcc:{cond_target_serial}, ft:{fallthrough_target_serial})"
-                                ),
-                            )
-                            queued_change = True
-                        else:
-                            # [SAFETY] Triangle check:
-                            # If target is conditional AND a direct dispatcher successor,
-                            # enforce a trampoline to break the "Switch Case -> Switch Case" edge.
-                            #
-                            # This prevents Hex-Rays crashes (INTERR/segfault) caused by
-                            # "Triangle with Shared Conditional Header" topology where a
-                            # conditional block is entered both from the switch (as a case)
-                            # and from another case block (via unflattening).
-                            is_target_in_dispatcher = False
-                            dispatcher_head = dispatcher_info.entry_block.blk
-                            if dispatcher_head:
-                                for i in range(dispatcher_head.nsucc()):
-                                    if dispatcher_head.succ(i) == target_blk.serial:
-                                        is_target_in_dispatcher = True
-                                        break
-
-                            # We use a relaxed definition of conditional here (ignoring nextb requirement)
-                            # because create_and_redirect works fine even for the last block.
-                            is_risky_conditional = (
-                                target_blk.nsucc() == 2
-                                and target_blk.tail is not None
-                                and ida_hexrays.is_mcode_jcond(target_blk.tail.opcode)
-                            )
-
-                            if is_risky_conditional and is_target_in_dispatcher:
-                                unflat_logger.info(
-                                    "Queuing trampoline for triangle edge: block %s -> %s",
-                                    dispatcher_father.serial,
-                                    target_blk.serial,
-                                )
-                                nop = ida_hexrays.minsn_t(dispatcher_father.tail.ea)
-                                nop.opcode = ida_hexrays.m_nop
-                                deferred_modifier.queue_create_and_redirect(
-                                    source_block_serial=dispatcher_father.serial,
-                                    final_target_serial=target_blk.serial,
-                                    instructions_to_copy=[nop],
-                                    is_0_way=(target_blk.type == ida_hexrays.BLT_0WAY),
-                                    description=f"resolve_dispatcher_father(trampoline) {dispatcher_father.serial} -> {target_blk.serial}",
-                                )
-                                queued_change = True
-                            else:
-                                unflat_logger.info(
-                                    "Queuing goto change: block %s -> %s",
-                                    dispatcher_father.serial,
-                                    target_blk.serial,
-                                )
-                                self._record_deferred_case_overlap_edge(
-                                    dispatcher_info.entry_block.serial,
-                                    dispatcher_father.serial,
-                                    target_blk.serial,
-                                )
-                                deferred_modifier.queue_goto_change(
-                                    block_serial=dispatcher_father.serial,
-                                    new_target=target_blk.serial,
-                                    description=f"resolve_dispatcher_father {dispatcher_father.serial} -> {target_blk.serial}",
-                                    rule_priority=100,  # High priority - proven constant analysis
-                                )
-                                queued_change = True
-                    elif source_nsucc == 2 and tail_opcode in CONDITIONAL_JUMP_OPCODES:
+                    unflat_logger.info(
+                        "Queuing create_and_redirect: %s instructions from block %s -> %s",
+                        len(copy_insns),
+                        dispatcher_father.serial,
+                        target_blk.serial,
+                    )
+                    deferred_modifier.queue_create_and_redirect(
+                        source_block_serial=dispatcher_father.serial,
+                        final_target_serial=target_blk.serial,
+                        instructions_to_copy=copy_insns,
+                        is_0_way=(target_blk.type == ida_hexrays.BLT_0WAY),
+                        description=f"resolve_dispatcher_father {dispatcher_father.serial} -> {target_blk.serial}",
+                    )
+                    # Record the edge so post-apply canonicalization catches
+                    # cross-case overlaps if deep cleaning later collapses the
+                    # intermediate block back into a direct edge.
+                    self._record_deferred_case_overlap_edge(
+                        dispatcher_info.entry_block.serial,
+                        dispatcher_father.serial,
+                        target_blk.serial,
+                    )
+                    queued_change = True
+            else:
+                if source_nsucc == 1:
+                    clone_conditional_targets = (
+                        os.environ.get("D810_UNFLAT_CLONE_COND_TARGET", "").strip().lower()
+                        in ("1", "true", "yes", "on")
+                    )
+                    # When the resolved target is itself a conditional 2-way
+                    # block, redirecting many new predecessors directly into
+                    # that shared block can produce unstable CFGs for some
+                    # large flattened functions (AntiDebug case). Instead,
+                    # clone the conditional shape and redirect the father to
+                    # the clone, following the same proven pattern used by
+                    # FixPredecessorOfConditionalJumpBlock.
+                    target_is_conditional = (
+                        target_blk.nsucc() == 2
+                        and target_blk.tail is not None
+                        and ida_hexrays.is_mcode_jcond(target_blk.tail.opcode)
+                        and target_blk.nextb is not None
+                    )
+                    if target_is_conditional and clone_conditional_targets:
+                        cond_target_serial = int(target_blk.tail.d.b)
+                        fallthrough_target_serial = int(target_blk.nextb.serial)
                         unflat_logger.info(
-                            "Queuing convert_to_goto for conditional father: block %s -> %s",
+                            "Queuing conditional redirect clone: father %s via ref %s "
+                            "(jcc->%s, fallthrough->%s)",
                             dispatcher_father.serial,
                             target_blk.serial,
+                            cond_target_serial,
+                            fallthrough_target_serial,
                         )
-                        self._record_deferred_case_overlap_edge(
-                            dispatcher_info.entry_block.serial,
-                            dispatcher_father.serial,
-                            target_blk.serial,
-                        )
-                        deferred_modifier.queue_convert_to_goto(
-                            block_serial=dispatcher_father.serial,
-                            goto_target=target_blk.serial,
+                        deferred_modifier.queue_create_conditional_redirect(
+                            source_blk_serial=dispatcher_father.serial,
+                            ref_blk_serial=target_blk.serial,
+                            conditional_target_serial=cond_target_serial,
+                            fallthrough_target_serial=fallthrough_target_serial,
                             description=(
-                                "resolve_dispatcher_father(convert) "
-                                f"{dispatcher_father.serial} -> {target_blk.serial}"
+                                "resolve_dispatcher_father(cond-clone) "
+                                f"{dispatcher_father.serial} -> ref {target_blk.serial} "
+                                f"(jcc:{cond_target_serial}, ft:{fallthrough_target_serial})"
                             ),
                         )
                         queued_change = True
                     else:
-                        unflat_logger.warning(
-                            "Skipping father rewrite for blk %d: nsucc=%d opcode=%s target=%d",
-                            dispatcher_father.serial,
-                            source_nsucc,
-                            tail_opcode,
-                            target_blk.serial,
+                        # [SAFETY] Triangle check:
+                        # If target is conditional AND a direct dispatcher successor,
+                        # enforce a trampoline to break the "Switch Case -> Switch Case" edge.
+                        #
+                        # This prevents Hex-Rays crashes (INTERR/segfault) caused by
+                        # "Triangle with Shared Conditional Header" topology where a
+                        # conditional block is entered both from the switch (as a case)
+                        # and from another case block (via unflattening).
+                        is_target_in_dispatcher = False
+                        dispatcher_head = dispatcher_info.entry_block.blk
+                        if dispatcher_head:
+                            for i in range(dispatcher_head.nsucc()):
+                                if dispatcher_head.succ(i) == target_blk.serial:
+                                    is_target_in_dispatcher = True
+                                    break
+
+                        # We use a relaxed definition of conditional here (ignoring nextb requirement)
+                        # because create_and_redirect works fine even for the last block.
+                        is_risky_conditional = (
+                            target_blk.nsucc() == 2
+                            and target_blk.tail is not None
+                            and ida_hexrays.is_mcode_jcond(target_blk.tail.opcode)
                         )
-                if not queued_change:
-                    return 0
-            else:
-                # Legacy direct CFG modifications
-                if len(ins_to_copy) > 0:
+
+                        if is_risky_conditional and is_target_in_dispatcher:
+                            unflat_logger.info(
+                                "Queuing trampoline for triangle edge: block %s -> %s",
+                                dispatcher_father.serial,
+                                target_blk.serial,
+                            )
+                            nop = ida_hexrays.minsn_t(dispatcher_father.tail.ea)
+                            nop.opcode = ida_hexrays.m_nop
+                            deferred_modifier.queue_create_and_redirect(
+                                source_block_serial=dispatcher_father.serial,
+                                final_target_serial=target_blk.serial,
+                                instructions_to_copy=[nop],
+                                is_0_way=(target_blk.type == ida_hexrays.BLT_0WAY),
+                                description=f"resolve_dispatcher_father(trampoline) {dispatcher_father.serial} -> {target_blk.serial}",
+                            )
+                            # Record trampoline edge so post-apply canonicalization
+                            # can detect and fix cross-case overlaps introduced by
+                            # trampoline blocks whose final target is a jtbl case.
+                            self._record_deferred_case_overlap_edge(
+                                dispatcher_info.entry_block.serial,
+                                dispatcher_father.serial,
+                                target_blk.serial,
+                            )
+                            queued_change = True
+                        else:
+                            unflat_logger.info(
+                                "Queuing goto change: block %s -> %s",
+                                dispatcher_father.serial,
+                                target_blk.serial,
+                            )
+                            self._record_deferred_case_overlap_edge(
+                                dispatcher_info.entry_block.serial,
+                                dispatcher_father.serial,
+                                target_blk.serial,
+                            )
+                            deferred_modifier.queue_goto_change(
+                                block_serial=dispatcher_father.serial,
+                                new_target=target_blk.serial,
+                                description=f"resolve_dispatcher_father {dispatcher_father.serial} -> {target_blk.serial}",
+                                rule_priority=100,  # High priority - proven constant analysis
+                            )
+                            queued_change = True
+                elif source_nsucc == 2 and tail_opcode in CONDITIONAL_JUMP_OPCODES:
                     unflat_logger.info(
-                        "Instruction copied: %s: %s",
-                        len(ins_to_copy),
-                        ", ".join(
-                            [format_minsn_t(ins_copied) for ins_copied in ins_to_copy]
+                        "Queuing convert_to_goto for conditional father: block %s -> %s",
+                        dispatcher_father.serial,
+                        target_blk.serial,
+                    )
+                    self._record_deferred_case_overlap_edge(
+                        dispatcher_info.entry_block.serial,
+                        dispatcher_father.serial,
+                        target_blk.serial,
+                    )
+                    deferred_modifier.queue_convert_to_goto(
+                        block_serial=dispatcher_father.serial,
+                        goto_target=target_blk.serial,
+                        description=(
+                            "resolve_dispatcher_father(convert) "
+                            f"{dispatcher_father.serial} -> {target_blk.serial}"
                         ),
                     )
-                    tail_serial = self.mba.qty - 1
-                    block_to_copy = self.mba.get_mblock(tail_serial)
-                    while block_to_copy.type == ida_hexrays.BLT_XTRN or block_to_copy.type == ida_hexrays.BLT_STOP:
-                        block_to_copy = self.mba.get_mblock(tail_serial)
-                        tail_serial -= 1
-                    dispatcher_side_effect_blk = create_block(
-                        block_to_copy, ins_to_copy, is_0_way=(target_blk.type == ida_hexrays.BLT_0WAY), verify=False
-                    )
-                    if dispatcher_father.nsucc() != 1:
-                        unflat_logger.warning(
-                            "Skipping legacy create_and_redirect for non-1way father blk %d (nsucc=%d)",
-                            dispatcher_father.serial,
-                            dispatcher_father.nsucc(),
-                        )
-                        return 0
-                    change_1way_block_successor(
-                        dispatcher_father, dispatcher_side_effect_blk.serial, verify=False
-                    )
-                    change_1way_block_successor(
-                        dispatcher_side_effect_blk, target_blk.serial, verify=False
-                    )
+                    queued_change = True
                 else:
-                    if dispatcher_father.nsucc() == 1:
-                        change_1way_block_successor(dispatcher_father, target_blk.serial, verify=False)
-                    else:
-                        unflat_logger.warning(
-                            "Skipping legacy rewrite for non-1way father blk %d (nsucc=%d)",
-                            dispatcher_father.serial,
-                            dispatcher_father.nsucc(),
-                        )
-                        return 0
+                    unflat_logger.warning(
+                        "Skipping father rewrite for blk %d: nsucc=%d opcode=%s target=%d",
+                        dispatcher_father.serial,
+                        source_nsucc,
+                        tail_opcode,
+                        target_blk.serial,
+                    )
+            if not queued_change:
+                return 0
             return 2
 
         raise NotResolvableFatherException(
@@ -2492,6 +2769,72 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
         total_nb_change = 0
         self.non_significant_changes = ensure_last_block_is_goto(self.mba, verify=False)
         self.non_significant_changes += self.ensure_all_dispatcher_fathers_are_direct()
+
+        # Full-MBA scan: catch BLT_NWAY+null-tail blocks that the direct-father
+        # loop missed (grandfathers, trampolines, etc.).  Try every known
+        # dispatcher entry serial — downgrade_nway_null_tail_to_1way() is a
+        # no-op when the serial is not a successor of the candidate block.
+        all_dispatcher_entry_serials = [
+            d.entry_block.blk.serial for d in self.dispatcher_list
+        ]
+        for i in range(self.mba.qty):
+            blk = self.mba.get_mblock(i)
+            if blk is None:
+                continue
+            if blk.type == ida_hexrays.BLT_NWAY and blk.tail is None and blk.nsucc() == 2:
+                fixed = False
+                for dispatcher_entry_serial in all_dispatcher_entry_serials:
+                    if downgrade_nway_null_tail_to_1way(
+                        blk, dispatcher_entry_serial, verify=False
+                    ):
+                        self.non_significant_changes += 1
+                        fixed = True
+                        break
+                if not fixed:
+                    # Indirect path: check if a successor is a 1-way trampoline
+                    # whose single successor is a dispatcher entry.
+                    succ_serials = [int(blk.succset[j]) for j in range(blk.succset.size())]
+                    for succ_serial in succ_serials:
+                        succ_blk = self.mba.get_mblock(succ_serial)
+                        if succ_blk is None:
+                            continue
+                        if (succ_blk.type == ida_hexrays.BLT_1WAY
+                                and succ_blk.nsucc() == 1
+                                and int(succ_blk.succset[0]) in all_dispatcher_entry_serials):
+                            trampoline_serial = succ_serial
+                            keep_serial = [s for s in succ_serials if s != trampoline_serial][0]
+                            insert_goto_instruction(blk, keep_serial, nop_previous_instruction=False)
+                            blk.type = ida_hexrays.BLT_1WAY
+                            blk.flags |= ida_hexrays.MBL_GOTO
+                            blk.succset._del(trampoline_serial)
+                            blk.mark_lists_dirty()
+                            trampoline_blk = self.mba.get_mblock(trampoline_serial)
+                            if trampoline_blk is not None:
+                                trampoline_blk.predset._del(blk.serial)
+                                if trampoline_blk.serial != self.mba.qty - 1:
+                                    trampoline_blk.mark_lists_dirty()
+                            keep_blk = self.mba.get_mblock(keep_serial)
+                            if keep_blk is not None:
+                                if not _serial_in_predset(keep_blk, blk.serial):
+                                    keep_blk.predset.push_back(blk.serial)
+                                if keep_blk.serial != self.mba.qty - 1:
+                                    keep_blk.mark_lists_dirty()
+                            self.mba.mark_chains_dirty()
+                            logger.info(
+                                "blk[%d] BLT_NWAY null-tail fixed via trampoline %d -> keep %d",
+                                blk.serial, trampoline_serial, keep_serial,
+                            )
+                            self.non_significant_changes += 1
+                            break
+            # Case 2: BLT_NWAY with goto tail and single successor → downgrade to BLT_1WAY
+            elif (blk.type == ida_hexrays.BLT_NWAY
+                  and blk.tail is not None
+                  and blk.nsucc() == 1
+                  and blk.tail.opcode == ida_hexrays.m_goto):
+                blk.type = ida_hexrays.BLT_1WAY
+                self.mba.mark_chains_dirty()
+                self.non_significant_changes += 1
+                logger.info("blk[%d] downgraded BLT_NWAY+goto to BLT_1WAY", blk.serial)
 
         # Reset tracking for this optimization pass
         self._processed_dispatcher_fathers.clear()
@@ -2598,14 +2941,37 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
                 if int(self.min_cfg_edges_required) > 0
                 else None
             )
-            if not should_apply_cfg_modifications(
+            safeguard_ok = should_apply_bulk_cfg_modifications(
                 num_redirected,
                 total_exit_blocks,
                 "generic",
                 min_required_override=min_cfg_edges_required,
-            ):
+            )
+            unflat_logger.info(
+                "dispatcher_rule gate: safeguard=%s, rule=%s, "
+                "redirected=%d, exit_blocks=%d",
+                safeguard_ok,
+                self.__class__.__name__,
+                num_redirected,
+                total_exit_blocks,
+            )
+            if not safeguard_ok:
                 deferred_modifier.reset()
             else:
+                # Second pass: catch any BLT_NWAY blocks created by
+                # duplicate_block() that inherited type from source.
+                for blk_serial in range(self.mba.qty):
+                    blk = self.mba.get_mblock(blk_serial)
+                    if blk is not None and blk.type == ida_hexrays.BLT_NWAY:
+                        tail = blk.tail
+                        if tail is not None and tail.opcode == ida_hexrays.m_goto and blk.nsucc() == 1:
+                            unflat_logger.debug(
+                                "generic: block %d BLT_NWAY+m_goto+nsucc==1 -> BLT_1WAY (pre-apply sweep)",
+                                blk_serial,
+                            )
+                            blk.type = ida_hexrays.BLT_1WAY
+                            self.mba.mark_chains_dirty()
+
                 unflat_logger.info(
                     "Applying %d deferred CFG modifications from resolve_dispatcher_father",
                     len(deferred_modifier.modifications),
@@ -2613,36 +2979,41 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
                 deferred_modifier.apply(
                     run_optimize_local=False,
                     run_deep_cleaning=False,
-                    verify_each_mod=(self.mba.maturity == ida_hexrays.MMAT_CALLS),
-                    rollback_on_verify_failure=(self.mba.maturity == ida_hexrays.MMAT_CALLS),
-                    continue_on_verify_failure=(self.mba.maturity == ida_hexrays.MMAT_CALLS),
-                    defer_post_apply_maintenance=True,
+                    verify_each_mod=True,
+                    rollback_on_verify_failure=True,
+                    continue_on_verify_failure=True,
+                    enable_snapshot_rollback=True,
                 )
-                if not deferred_modifier.verify_failed:
-                    unflat_logger.info(
-                        "Post-apply jtbl overlap scan: %d dispatcher edge-set(s)",
-                        len(self._deferred_case_overlap_edges),
-                    )
-                    canonicalized_cases = self._canonicalize_jtbl_cross_case_overlaps()
-                    if canonicalized_cases > 0:
+                if not deferred_modifier.verify_failed and self._deferred_case_overlap_edges:
+                    try:
                         unflat_logger.info(
-                            "Applied jtbl overlap canonicalization: %d case target retarget(s)",
-                            canonicalized_cases,
+                            "Post-apply jtbl overlap scan: %d dispatcher edge-set(s)",
+                            len(self._deferred_case_overlap_edges),
                         )
+                        canonicalized_cases = self._canonicalize_jtbl_cross_case_overlaps()
+                        if canonicalized_cases > 0:
+                            unflat_logger.info(
+                                "Applied jtbl overlap canonicalization: %d case target retarget(s)",
+                                canonicalized_cases,
+                            )
                         safe_verify(
                             self.mba,
                             "after jtbl cross-case overlap canonicalization",
                             logger_func=unflat_logger.error,
                         )
+                        mba_deep_cleaning(self.mba, True)
+                        safe_verify(
+                            self.mba,
+                            "after post-canonicalization deep clean",
+                            logger_func=unflat_logger.error,
+                        )
                         total_nb_change += canonicalized_cases
-                    # DeferredGraphModifier maintenance is deferred so we can
-                    # canonicalize switch-case overlaps first.
-                    mba_deep_cleaning(self.mba, call_mba_combine_block=False)
-                    safe_verify(
-                        self.mba,
-                        "after deferred modifications (generic post-maintenance)",
-                        logger_func=unflat_logger.error,
-                    )
+                    except RuntimeError:
+                        unflat_logger.warning(
+                            "verify failed during post-apply canonicalization; "
+                            "discarding modifications for this function"
+                        )
+                        self._verify_failed = True
 
             if deferred_modifier.verify_failed:
                 self._verify_failed = True
@@ -2652,8 +3023,10 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
                     "IDA from continuing with a corrupted MBA",
                     len(deferred_modifier.modifications),
                 )
-                # Return what we have so IDA knows the MBA was modified,
-                # but skip further processing that would compound corruption.
+                # Return the patch count to the caller (optimize()) which will
+                # store it in last_pass_nb_patch_done.  optimize() will detect
+                # _verify_failed and return 0 to IDA -- returning non-zero to
+                # IDA triggers its own verify on a corrupted MBA (INTERR 50860).
                 total_nb_change += nb_flattened_branches
                 return total_nb_change
 
@@ -2664,9 +3037,105 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
                 "Found %d provable single-iteration loops after unflattening", loops_found
             )
 
+        # Post-apply instruction sweep (const prop, peephole, etc.)
+        self._post_apply_instruction_sweep()
+
         unflat_logger.info("Unflattening removed %s branch", nb_flattened_branches)
         total_nb_change += nb_flattened_branches
         return total_nb_change
+
+    MAX_POST_APPLY_ITERATIONS = 10
+
+    def _post_apply_instruction_sweep(self) -> None:
+        """Run ForwardConstProp + targeted peephole rules on freshly unflattened blocks.
+
+        Iterates FCP -> peephole in a fixpoint loop so that constants produced
+        by folding ROL/XOR chains are immediately re-propagated by FCP, enabling
+        further folds (e.g. readonly-data table lookups).  Loop terminates when
+        no phase produces changes or after MAX_POST_APPLY_ITERATIONS rounds.
+        """
+        if not self.post_apply_const_prop:
+            return
+
+        from d810.optimizers.microcode.flow.constant_prop.forward_const_prop import ForwardConstantPropagationRule
+        from d810.cfg.lattice import LatticeMeet, BOTTOM, TOP
+        from d810.optimizers.microcode.instructions.peephole.fold_rotatehelper import RotateHelperInlineRule
+        from d810.optimizers.microcode.instructions.peephole.fold_constant_subtree import ConstantSubtreeFoldRule
+        from d810.optimizers.microcode.instructions.peephole.fold_readonlydata import FoldReadonlyDataRule
+
+        peephole_rules = [ConstantSubtreeFoldRule(), RotateHelperInlineRule(), FoldReadonlyDataRule()]
+        total_changes = 0
+
+        for generation in range(self.MAX_POST_APPLY_ITERATIONS):
+            iter_changes = 0
+
+            # Phase A: FCP — propagate constants into newly unflattened blocks.
+            # Use TOP (conservative) for missing predecessors: after unflattening the
+            # linearised CFG has incomplete predecessor environments for newly wired
+            # blocks.  BOTTOM (aggressive identity) would let any Const(k) from a
+            # single predecessor — e.g. the "int result = 0" initialisation — dominate
+            # through join points and incorrectly fold live function parameters to 0.
+            const_prop = ForwardConstantPropagationRule(meet_strategy=LatticeMeet(default_missing=TOP))
+            try:
+                fcp_changes = const_prop._run_on_function(self.mba)
+            except Exception as exc:
+                unflat_logger.warning(
+                    "Post-apply ForwardConstProp failed at generation %d (aborting sweep, "
+                    "will skip further passes to avoid operating on corrupted MBA): %s",
+                    generation, exc,
+                )
+                if total_changes > 0:
+                    self.mba.mark_chains_dirty()
+                    try:
+                        self.mba.optimize_local(0)
+                    except Exception:
+                        pass
+                self._verify_failed = True
+                break
+
+            iter_changes += fcp_changes
+
+            # Phase B: Peephole folds with per-block fixpoint
+            peephole_changes = 0
+            for blk_serial in range(self.mba.qty):
+                blk = self.mba.get_mblock(blk_serial)
+                changed_in_block = True
+                while changed_in_block:
+                    changed_in_block = False
+                    ins = blk.head
+                    while ins:
+                        next_ins = ins.next
+                        for rule in peephole_rules:
+                            new_ins = rule.check_and_replace(blk, ins)
+                            if new_ins is not None:
+                                ins.swap(new_ins)
+                                peephole_changes += 1
+                                changed_in_block = True
+                                break  # restart block scan
+                        if changed_in_block:
+                            break
+                        ins = next_ins
+
+            iter_changes += peephole_changes
+            total_changes += iter_changes
+
+            if unflat_logger.debug_on:
+                unflat_logger.debug(
+                    "Post-apply sweep generation %d: fcp=%d peephole=%d total_iter=%d",
+                    generation, fcp_changes, peephole_changes, iter_changes,
+                )
+
+            if iter_changes == 0:
+                break
+
+            # Let IDA re-optimize before next round
+            self.mba.mark_chains_dirty()
+            self.mba.optimize_local(0)
+
+        if total_changes > 0:
+            unflat_logger.info(
+                "Post-apply sweep complete: %d total change(s)", total_changes
+            )
 
     # Maximum wall-clock seconds for a single optimize() call.
     MAX_OPTIMIZE_SECONDS = 30.0
@@ -2675,6 +3144,13 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
         import time as _time
         self.mba = blk.mba
         self._apply_function_overrides()
+        # Reset per-function state when a new function begins decompilation.
+        func_ea = blk.mba.entry_ea
+        cur_mat = blk.mba.maturity
+        if func_ea != self._last_function_ea or cur_mat != self._last_maturity:
+            self._last_function_ea = func_ea
+            self._last_maturity = cur_mat
+            self._verify_failed = False
         if not self.check_if_rule_should_be_used(blk):
             return 0
 
@@ -2801,7 +3277,7 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
                         dispatcher_info,
                     )
                 except Exception as e:
-                    print(e)
+                    unflat_logger.error("%s", e)
             unflat_logger.info(
                 "Fixed %s instructions in father history",
                 total_fixed_father_block,
@@ -2817,14 +3293,18 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
         # If deferred modifier verify failed, the MBA is in a suspect state.
         # Skip deep cleaning / optimize_local / safe_verify which would either
         # fail or compound the corruption, causing IDA to hang at later
-        # maturity levels.  Return the patch count so IDA knows the MBA was
-        # touched and doesn't silently reuse the bad state.
+        # maturity levels.  Return 0 (not the patch count) so IDA does NOT
+        # trigger its own internal verify on the corrupted MBA -- returning
+        # non-zero causes INTERR 50860 and permanent decompiler corruption.
         if self._verify_failed:
             unflat_logger.warning(
-                "Skipping post-unflattening cleanup because MBA verify "
-                "failed during deferred modifications"
+                "Returning 0 to IDA despite %d patches applied -- MBA verify "
+                "failed, returning non-zero would trigger IDA's own verify "
+                "on corrupted MBA causing INTERR 50860 and permanent "
+                "decompiler corruption",
+                self.last_pass_nb_patch_done + initial_changes,
             )
-            return self.last_pass_nb_patch_done + initial_changes
+            return 0
 
         nb_clean = mba_deep_cleaning(self.mba, False)
         if self.dump_intermediate_microcode:
@@ -2841,4 +3321,27 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
             "optimizing GenericDispatcherUnflatteningRule.optimize",
             logger_func=unflat_logger.error,
         )
+        # Safety: detect cross-case topology that crashes IDA's structurer
+        if not self._verify_failed and self._has_cross_case_hazard():
+            self._verify_failed = True
+            if self.last_pass_nb_patch_done > 0:
+                # Patches were applied this pass -- IDA needs a non-zero return
+                # to trigger its own optimizers (constant folding, etc.) so the
+                # user sees the unflattened+folded output.  _verify_failed=True
+                # prevents d810 from running further passes on this function.
+                unflat_logger.warning(
+                    "Cross-case jtbl topology detected after %d patches -- "
+                    "disabling further d810 passes but reporting changes to IDA",
+                    self.last_pass_nb_patch_done,
+                )
+                return self.last_pass_nb_patch_done + initial_changes
+            else:
+                # No patches this pass -- MBA is already in the bad state;
+                # returning 0 keeps IDA from re-running its structurer on it.
+                unflat_logger.warning(
+                    "Cross-case jtbl topology detected -- returning 0 to prevent structurer crash",
+                )
+                return 0
+        if self._verify_failed:
+            return 0
         return self.last_pass_nb_patch_done + initial_changes

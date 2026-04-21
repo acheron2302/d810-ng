@@ -3,52 +3,74 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import inspect
+import json
+import os
 import pathlib
 import pstats
+import tempfile
+import time
 
 try:
     import cProfile
 except ImportError:
     cProfile = None  # type: ignore[assignment]
-import time
-from d810.core import typing
-from d810.core.typing import TYPE_CHECKING
 
+from d810.backends.mba.ida import adapt_rules
+from d810.core import MOP_CONSTANT_CACHE, MOP_TO_AST_CACHE, typing
 from d810.core.config import D810Configuration, ProjectConfiguration
 from d810.core.logging import clear_logs, configure_loggers, getLogger
-from d810.core import MOP_CONSTANT_CACHE, MOP_TO_AST_CACHE
-from d810.core.persistence import ActiveRuleRecipeConfig, create_optimization_storage
+from d810.core.persistence import ActiveRuleInferenceConfig, create_optimization_storage
 from d810.core.platform import resolve_arch_config
 from d810.core.project import ProjectContext, ProjectManager
-from d810.core.registry import EventEmitter
+from d810.core.registry import EventEmitter, SingletonMeta
 from d810.core.rule_scope import (
     FunctionRuleOverlay,
-    RuleRecipeOverlay,
+    RuleInferenceOverlay,
     RuleScopeEvent,
     RuleScopeInvalidation,
     RuleScopeService,
 )
-from d810.core.singleton import SingletonMeta
 from d810.core.stats import OptimizationStatistics
-from d810.hexrays.ctree_hooks import CtreeOptimizerManager, CtreeOptimizationRule
-from d810.hexrays.hexrays_hooks import (
+from d810.core.typing import TYPE_CHECKING
+from d810.backends.ast.z3 import Z3MopProver
+from d810.hexrays.hooks.ctree_hooks import CtreeOptimizationRule, CtreeOptimizerManager
+from d810.hexrays.hooks.hexrays_hooks import (
     BlockOptimizerManager,
     DecompilationEvent,
     HexraysDecompilationHook,
     InstructionOptimizerManager,
 )
-from d810.mba.backends.ida import adapt_rules
 from d810.mba.rules import VerifiableRule
+from d810.optimizers.microcode.flow.context import FlowMaturityContext
 from d810.optimizers.microcode.flow.handler import FlowOptimizationRule
-from d810.optimizers.microcode.instructions.handler import InstructionOptimizationRule
-
-if TYPE_CHECKING:
-    from d810.ui.ida_ui import D810GUI
+from d810.optimizers.microcode.instructions.handler import (
+    InstructionOptimizationRule,
+    InstructionOptimizer,
+)
+from d810.recon.collectors.cfg_shape import CFGShapeCollector
+from d810.recon.collectors.compare_chain import CompareChainCollector
+from d810.recon.collectors.ctree_structure import CtreeStructureCollector
+from d810.recon.collectors.dispatch_pattern import DispatchPatternCollector
+from d810.recon.collectors.fixpred_signals import FixPredSignalsCollector
+from d810.recon.collectors.handler_transitions import HandlerTransitionsCollector
+from d810.recon.collectors.opcode_distribution import OpcodeDistributionCollector
+from d810.recon.collectors.profile_classifier import FlowProfileClassifierCollector
+from d810.recon.collectors.return_frontier import ReturnFrontierCollector
+from d810.recon.microcode_dump import mba_to_dict
+from d810.recon.analysis import AnalysisPhase
+from d810.recon.inferences import unflattening_inference
+from d810.recon.phase import ReconPhase
+from d810.recon.runtime import ReconAnalysisRuntime
+from d810.recon.store import ReconStore
 
 try:
     import pyinstrument  # type: ignore
 except ImportError:
     pyinstrument = None
+
+if TYPE_CHECKING:
+    from d810.ui.ida_ui import D810GUI
+
 
 D810_LOG_DIR_NAME = "d810_logs"
 
@@ -94,6 +116,7 @@ def _maturity_name(maturity: int) -> str:
     """Map IDA maturity integer to a human-readable name for file labels."""
     try:
         import ida_hexrays
+
         _names = {
             ida_hexrays.MMAT_ZERO: "MMAT_ZERO",
             ida_hexrays.MMAT_GENERATED: "MMAT_GENERATED",
@@ -113,7 +136,9 @@ def _maturity_name(maturity: int) -> str:
 @dataclasses.dataclass
 class D810Manager:
     log_dir: pathlib.Path
-    stats: OptimizationStatistics = dataclasses.field(default_factory=OptimizationStatistics)
+    stats: OptimizationStatistics = dataclasses.field(
+        default_factory=OptimizationStatistics
+    )
     instruction_optimizer_rules: list = dataclasses.field(default_factory=list)
     instruction_optimizer_config: dict = dataclasses.field(default_factory=dict)
     block_optimizer_rules: list = dataclasses.field(default_factory=list)
@@ -122,9 +147,13 @@ class D810Manager:
     ctree_optimizer_config: dict = dataclasses.field(default_factory=dict)
     config: dict = dataclasses.field(default_factory=dict)
     event_emitter: EventEmitter = dataclasses.field(default_factory=EventEmitter)
-    rule_scope_service: RuleScopeService = dataclasses.field(default_factory=RuleScopeService)
+    rule_scope_service: RuleScopeService = dataclasses.field(
+        default_factory=RuleScopeService
+    )
     storage: typing.Any = None
-    _active_rule_recipe: RuleRecipeOverlay | None = dataclasses.field(default=None, init=False)
+    _active_rule_inference: RuleInferenceOverlay | None = dataclasses.field(
+        default=None, init=False
+    )
     profiler: typing.Any = dataclasses.field(
         default_factory=lambda: pyinstrument.Profiler() if pyinstrument else None
     )
@@ -138,10 +167,19 @@ class D810Manager:
     _started: bool = dataclasses.field(default=False, init=False)
     _profiling_enabled: bool = dataclasses.field(default=False, init=False)
     _start_ts: float = dataclasses.field(default=0.0, init=False)
+    _recon_phase: typing.Any = dataclasses.field(default=None, init=False)
 
     @property
     def started(self):
         return self._started
+
+    @property
+    def recon_db(self) -> pathlib.Path | None:
+        """Path to the recon SQLite database, or None if recon is disabled."""
+        rt = getattr(self, "_recon_runtime", None)
+        if rt is None:
+            return None
+        return rt._store.db_path
 
     def configure(self, **kwargs):
         self.config = kwargs
@@ -217,17 +255,69 @@ class D810Manager:
         self.cprofiler.snapshot(str(output_path))
         logger.info("Profiling segment dumped for %s: %s", label, output_path)
 
+    def capture_post_d810_mba(
+        self,
+        mba: typing.Any,
+        maturity: int,
+    ) -> None:
+        """Write post-maturity MBA snapshot when configured via environment."""
+        capture_mat_str = os.environ.get("D810_CAPTURE_POST_MATURITY")
+        if not capture_mat_str:
+            return
+        try:
+            target_mat = int(capture_mat_str)
+        except ValueError:
+            return
+        if int(maturity) != target_mat:
+            return
+        capture_file = os.environ.get("D810_CAPTURE_POST_FILE", "/tmp/d810_capture.txt")
+        try:
+            data = mba_to_dict(mba)
+            with open(capture_file, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2)
+            logger.info(
+                "Post-D810 MBA captured at maturity %s -> %s (%d blocks)",
+                _maturity_name(maturity),
+                capture_file,
+                data.get("num_blocks", -1),
+            )
+        except Exception:
+            logger.exception("Post-D810 capture failed")
+
     def start(self):
         if self._started:
             self.stop()
         logger.debug("Starting manager...")
+        # Ensure side-effect registrants are loaded before manager construction.
+        from d810.optimizers.microcode.instructions.pattern_matching import (  # noqa: F401
+            experimental,
+        )
+
+        try:
+            from d810.mba.backend_registry import get_egglog_provider
+
+            if bool(get_egglog_provider("egglog").is_available()):
+                from d810.optimizers.microcode.flow.egraph import (  # noqa: F401
+                    block_optimizer,
+                )
+                from d810.optimizers.microcode.instructions.egraph import (  # noqa: F401
+                    egglog_handler,
+                )
+        except ImportError:
+            pass
+
         self.rule_scope_service.attach(self.event_emitter)
         self._init_storage()
         self.rule_scope_service.set_overlay_provider(self._get_rule_overlay)
-        self.rule_scope_service.set_active_recipe(self._active_rule_recipe)
+        self.rule_scope_service.set_active_inference(self._active_rule_inference)
+        self.rule_scope_service.register_inference(
+            "unflattening", unflattening_inference
+        )
 
         # Instantiate core manager classes from registry
-        self.instruction_optimizer = InstructionOptimizerManager(self.stats, self.log_dir)
+        self.instruction_optimizer = InstructionOptimizerManager(
+            self.stats, self.log_dir, optimizer_cls=InstructionOptimizer
+        )
         project_name = str(self.config.get("project_name", ""))
         idb_key = str(self.config.get("idb_key", project_name))
         self.instruction_optimizer.configure(
@@ -236,15 +326,15 @@ class D810Manager:
             rule_scope_project_name=project_name,
             rule_scope_idb_key=idb_key,
         )
-        self.block_optimizer = BlockOptimizerManager(self.stats, self.log_dir)
+        self.block_optimizer = BlockOptimizerManager(
+            self.stats, self.log_dir, ctx_cls=FlowMaturityContext
+        )
         self.block_optimizer.configure(
             **self.block_optimizer_config,
             rule_scope_service=self.rule_scope_service,
             rule_scope_project_name=project_name,
             rule_scope_idb_key=idb_key,
         )
-        self.ctree_optimizer = CtreeOptimizerManager(self.stats)
-
         for rule in self.instruction_optimizer_rules:
             rule.log_dir = self.log_dir
             self.instruction_optimizer.add_rule(rule)
@@ -252,6 +342,50 @@ class D810Manager:
         for cfg_rule in self.block_optimizer_rules:
             cfg_rule.log_dir = self.log_dir
             self.block_optimizer.add_rule(cfg_rule)
+
+        # Build PassPipeline when feature flag is enabled (default OFF).
+        # Zero overhead when disabled - no imports of pass modules occur.
+        _pass_pipeline = None
+        if self.config.get("enable_pass_pipeline", False):
+            _pass_pipeline = self._build_pass_pipeline()
+
+        # Build ReconPhase when feature flag is enabled (default ON).
+        # Passive collection with minimal overhead; disable with
+        # "enable_recon_pipeline": false in project config.
+        self._recon_phase = None
+        if self.config.get("enable_recon_pipeline", True):
+            self._recon_phase = self._build_recon_phase()
+
+        # Wire recon phase + runtime into microcode optimizers.
+        # The runtime provides reset_for_func() at decompilation start;
+        # the phase dispatches collectors at each maturity.
+        self._recon_runtime = None
+        if self._recon_phase is not None:
+            self._recon_runtime = ReconAnalysisRuntime(
+                self._recon_phase,
+                AnalysisPhase(),
+                self._recon_phase._store,
+            )
+            self.instruction_optimizer.configure(
+                recon_phase=self._recon_phase,
+                recon_runtime=self._recon_runtime,
+            )
+            self.block_optimizer.configure(
+                recon_phase=self._recon_phase,
+                recon_runtime=self._recon_runtime,
+            )
+
+        # Wire PassPipeline into BlockOptimizerManager so it fires at
+        # MMAT_GLBOPT2, after the unflattener has run at MMAT_GLBOPT1.
+        if _pass_pipeline is not None:
+            self.block_optimizer.configure(pass_pipeline=_pass_pipeline)
+
+        # Build ctree optimizer with recon phase and runtime from the start.
+        self.ctree_optimizer = CtreeOptimizerManager(
+            self.stats,
+            recon_phase=self._recon_phase,
+            recon_runtime=self._recon_runtime,
+        )
 
         for ctree_rule in self.ctree_optimizer_rules:
             ctree_rule.log_dir = self.log_dir
@@ -267,7 +401,9 @@ class D810Manager:
 
     def _init_storage(self) -> None:
         old_storage = self.storage
-        backend = str(self.config.get("function_rules_backend", "sqlite")).strip().lower()
+        backend = (
+            str(self.config.get("function_rules_backend", "sqlite")).strip().lower()
+        )
         target = self.config.get("function_rules_storage")
         if target is None:
             if backend == "sqlite":
@@ -286,7 +422,7 @@ class D810Manager:
                 backend,
                 target,
             )
-            self._load_active_recipe_from_storage()
+            self._load_active_inference_from_storage()
             self.emit_rule_scope_invalidation(
                 RuleScopeEvent.IDB_OVERLAY_RELOADED,
                 project_name=str(self.config.get("project_name", "")),
@@ -299,36 +435,40 @@ class D810Manager:
                 project_name=str(self.config.get("project_name", "")),
             )
 
-    def _load_active_recipe_from_storage(self) -> None:
+    def _load_active_inference_from_storage(self) -> None:
         storage = self.storage
-        if storage is None or not hasattr(storage, "get_active_rule_recipe"):
-            self._active_rule_recipe = None
-            self.rule_scope_service.set_active_recipe(None)
+        if storage is None or not hasattr(storage, "get_active_rule_inference"):
+            self._active_rule_inference = None
+            self.rule_scope_service.set_active_inference(None)
             return
-        persisted = storage.get_active_rule_recipe()
+        persisted = storage.get_active_rule_inference()
         if persisted is None:
-            self._active_rule_recipe = None
-            self.rule_scope_service.set_active_recipe(None)
+            self._active_rule_inference = None
+            self.rule_scope_service.set_active_inference(None)
             return
-        recipe = RuleRecipeOverlay(
-            name=str(persisted.name).strip() or "unnamed_recipe",
+        inference = RuleInferenceOverlay(
+            name=str(persisted.name).strip() or "unnamed_inference",
             enabled_rules=frozenset(str(rule) for rule in persisted.enabled_rules),
             disabled_rules=frozenset(str(rule) for rule in persisted.disabled_rules),
             target_func_eas=frozenset(int(ea) for ea in persisted.target_func_eas),
             target_tags_any=frozenset(
-                str(tag).strip() for tag in persisted.target_tags_any if str(tag).strip()
+                str(tag).strip()
+                for tag in persisted.target_tags_any
+                if str(tag).strip()
             ),
             target_tags_all=frozenset(
-                str(tag).strip() for tag in persisted.target_tags_all if str(tag).strip()
+                str(tag).strip()
+                for tag in persisted.target_tags_all
+                if str(tag).strip()
             ),
             notes=str(persisted.notes),
         )
-        self._active_rule_recipe = recipe
-        self.rule_scope_service.set_active_recipe(recipe)
+        self._active_rule_inference = inference
+        self.rule_scope_service.set_active_inference(inference)
         self.emit_rule_scope_invalidation(
-            RuleScopeEvent.RECIPE_APPLIED,
+            RuleScopeEvent.INFERENCE_APPLIED,
             project_name=str(self.config.get("project_name", "")),
-            changed_rules=frozenset(recipe.enabled_rules | recipe.disabled_rules),
+            changed_rules=frozenset(inference.enabled_rules | inference.disabled_rules),
         )
 
     def _get_rule_overlay(self, function_ea: int) -> FunctionRuleOverlay | None:
@@ -374,7 +514,9 @@ class D810Manager:
             RuleScopeEvent.FUNCTION_OVERRIDE_UPDATED,
             project_name=str(self.config.get("project_name", "")),
             func_eas=frozenset({int(function_addr)}),
-            changed_rules=frozenset((enabled_rules or set()) | (disabled_rules or set())),
+            changed_rules=frozenset(
+                (enabled_rules or set()) | (disabled_rules or set())
+            ),
         )
 
     def get_function_tags(self, function_addr: int) -> set[str]:
@@ -400,7 +542,9 @@ class D810Manager:
         if not hasattr(self.storage, "set_function_tags"):
             logger.warning("Function-rules storage does not support function tags")
             return
-        normalized_tags = {str(tag).strip() for tag in (tags or set()) if str(tag).strip()}
+        normalized_tags = {
+            str(tag).strip() for tag in (tags or set()) if str(tag).strip()
+        }
         self.storage.set_function_tags(function_addr, normalized_tags)
         self.emit_rule_scope_invalidation(
             RuleScopeEvent.FUNCTION_TAGS_UPDATED,
@@ -408,10 +552,10 @@ class D810Manager:
             func_eas=frozenset({int(function_addr)}),
         )
 
-    def set_active_rule_recipe(
+    def set_active_rule_inference(
         self,
         *,
-        recipe_name: str,
+        inference_name: str,
         enabled_rules: typing.Optional[typing.Set[str]] = None,
         disabled_rules: typing.Optional[typing.Set[str]] = None,
         target_func_eas: typing.Optional[typing.Set[int]] = None,
@@ -421,53 +565,63 @@ class D810Manager:
     ) -> None:
         if self.storage is None:
             self._init_storage()
-        recipe = RuleRecipeOverlay(
-            name=str(recipe_name).strip() or "unnamed_recipe",
+        inference = RuleInferenceOverlay(
+            name=str(inference_name).strip() or "unnamed_inference",
             enabled_rules=frozenset(enabled_rules or set()),
             disabled_rules=frozenset(disabled_rules or set()),
             target_func_eas=frozenset(int(ea) for ea in (target_func_eas or set())),
             target_tags_any=frozenset(
-                str(tag).strip() for tag in (target_tags_any or set()) if str(tag).strip()
+                str(tag).strip()
+                for tag in (target_tags_any or set())
+                if str(tag).strip()
             ),
             target_tags_all=frozenset(
-                str(tag).strip() for tag in (target_tags_all or set()) if str(tag).strip()
+                str(tag).strip()
+                for tag in (target_tags_all or set())
+                if str(tag).strip()
             ),
             notes=notes,
         )
-        self._active_rule_recipe = recipe
-        self.rule_scope_service.set_active_recipe(recipe)
-        if self.storage is not None and hasattr(self.storage, "set_active_rule_recipe"):
-            self.storage.set_active_rule_recipe(
-                ActiveRuleRecipeConfig(
-                    name=recipe.name,
-                    enabled_rules=set(recipe.enabled_rules),
-                    disabled_rules=set(recipe.disabled_rules),
-                    target_func_eas=set(recipe.target_func_eas),
-                    target_tags_any=set(recipe.target_tags_any),
-                    target_tags_all=set(recipe.target_tags_all),
-                    notes=recipe.notes,
+        self._active_rule_inference = inference
+        self.rule_scope_service.set_active_inference(inference)
+        if self.storage is not None and hasattr(
+            self.storage, "set_active_rule_inference"
+        ):
+            self.storage.set_active_rule_inference(
+                ActiveRuleInferenceConfig(
+                    name=inference.name,
+                    enabled_rules=set(inference.enabled_rules),
+                    disabled_rules=set(inference.disabled_rules),
+                    target_func_eas=set(inference.target_func_eas),
+                    target_tags_any=set(inference.target_tags_any),
+                    target_tags_all=set(inference.target_tags_all),
+                    notes=inference.notes,
                 )
             )
         self.emit_rule_scope_invalidation(
-            RuleScopeEvent.RECIPE_APPLIED,
+            RuleScopeEvent.INFERENCE_APPLIED,
             project_name=str(self.config.get("project_name", "")),
-            changed_rules=frozenset((enabled_rules or set()) | (disabled_rules or set())),
+            changed_rules=frozenset(
+                (enabled_rules or set()) | (disabled_rules or set())
+            ),
         )
 
-    def clear_active_rule_recipe(self) -> None:
+    def clear_active_rule_inference(self) -> None:
         if self.storage is None:
             self._init_storage()
-        self._active_rule_recipe = None
-        self.rule_scope_service.set_active_recipe(None)
-        if self.storage is not None and hasattr(self.storage, "clear_active_rule_recipe"):
-            self.storage.clear_active_rule_recipe()
+        self._active_rule_inference = None
+        self.rule_scope_service.set_active_inference(None)
+        if self.storage is not None and hasattr(
+            self.storage, "clear_active_rule_inference"
+        ):
+            self.storage.clear_active_rule_inference()
         self.emit_rule_scope_invalidation(
-            RuleScopeEvent.RECIPE_CLEARED,
+            RuleScopeEvent.INFERENCE_CLEARED,
             project_name=str(self.config.get("project_name", "")),
         )
 
-    def get_active_rule_recipe(self) -> RuleRecipeOverlay | None:
-        return self._active_rule_recipe
+    def get_active_rule_inference(self) -> RuleInferenceOverlay | None:
+        return self._active_rule_inference
 
     def _compile_rule_scope(self) -> None:
         self.rule_scope_service.compile_base_rules(
@@ -497,8 +651,10 @@ class D810Manager:
             self.stats.reset,
             MOP_CONSTANT_CACHE.clear,
             MOP_TO_AST_CACHE.clear,
+            Z3MopProver().clear_caches,
             self.instruction_optimizer.reset_cycle_detection,
             self.block_optimizer.reset_pass_counter,
+            self.block_optimizer.reset_pipeline_tracker,
             self.block_optimizer.reset_perf_counters,
             self._start_timer,
         ):
@@ -516,23 +672,118 @@ class D810Manager:
         ):
             self.event_emitter.on(DecompilationEvent.FINISHED, _subscriber)
 
-        self.event_emitter.on(DecompilationEvent.MATURITY_CHANGED, self.dump_profiling_segment)
+        if self._recon_runtime is not None:
+            self.event_emitter.on(
+                DecompilationEvent.FINISHED,
+                self._recon_runtime.mark_decompilation_finished,
+            )
+
+        self.event_emitter.on(
+            DecompilationEvent.MATURITY_CHANGED, self.dump_profiling_segment
+        )
+        self.event_emitter.on(
+            DecompilationEvent.POST_D810_CAPTURE, self.capture_post_d810_mba
+        )
 
         self.instruction_optimizer.event_emitter = self.event_emitter
+        self.block_optimizer.event_emitter = self.event_emitter
         self.instruction_optimizer.install()
         self.block_optimizer.install()
         self.hx_decompiler_hook.hook()
 
+    def _build_pass_pipeline(self):
+        """Construct a PassPipeline with the 2 safe cleanup FlowGraphTransformes for MMAT_GLBOPT2.
+
+        Only called when config["enable_pass_pipeline"] is True. Imports are
+        deferred here so that pass modules are never loaded when the flag is
+        disabled (zero overhead guarantee).
+
+        The following transform are included:
+        - SimplifyIdenticalBranchPass: 2-way blocks with identical targets -> goto
+          (emits ConvertToGoto / RedirectBranch, handled correctly by deferred modifier)
+        - GotoChainRemovalPass: consecutive goto chains -> direct target
+          (emits RedirectGoto / RedirectBranch, handled correctly by deferred modifier)
+
+        The following transform are intentionally excluded at MMAT_GLBOPT2:
+        - DeadBlockEliminationPass: emits NopInstructions which calls blk.make_nop().
+          make_nop() removes the goto but does not update block type or edges, so
+          mba.verify(True) rejects the inconsistent state at MMAT_GLBOPT2.
+          The legacy equivalent (BlockMerger) only runs at MMAT_CALLS/MMAT_GLBOPT1.
+        - BlockMergePass: same reason - emits NopInstructions on trailing gotos,
+          which leaves dangling edges that fail verification at MMAT_GLBOPT2.
+
+        OpaqueJumpFixerPass and FakeJumpFixerPass are also excluded -
+        they require pre-computed fix dicts from the legacy analysis side.
+
+        Returns:
+            PassPipeline instance with IDAIRTranslator and the 2 safe cleanup transform.
+        """
+        from d810.cfg.pipeline import FlowGraphTransformPipeline
+        from d810.cfg.transform.simplify_identical_branch import (
+            SimplifyIdenticalBranchPass,
+        )
+        from d810.hexrays.mutation.ir_translator import IDAIRTranslator
+        from d810.hexrays.mutation.transform.goto_chain_removal import (
+            GotoChainRemovalPass,
+        )
+
+        backend = IDAIRTranslator()
+        passes = [
+            SimplifyIdenticalBranchPass(),
+            GotoChainRemovalPass(),
+        ]
+        pipeline = FlowGraphTransformPipeline(backend, passes)
+        logger.info(
+            "PassPipeline enabled: %s",
+            repr(pipeline),
+        )
+        return pipeline
+
+    def _build_recon_phase(self) -> "ReconPhase | None":
+        """Construct a ReconPhase with all flow-recovery collectors.
+
+        Only called when config["enable_recon_pipeline"] is True (the default).
+        Imports are guarded at module level - if the recon package is unavailable
+        this returns None and the plugin loads normally.
+
+        Returns:
+            ReconPhase instance with all collectors registered, or None on failure.
+        """
+        try:
+            db_path = (self.log_dir / "d810_recon.db") if self.log_dir else None
+            if db_path is None:
+                db_path = pathlib.Path(tempfile.gettempdir()) / "d810_recon.db"
+            store = ReconStore(db_path)
+            phase = ReconPhase(store=store)
+            phase.register(CFGShapeCollector())
+            phase.register(OpcodeDistributionCollector())
+            phase.register(DispatchPatternCollector())
+            phase.register(HandlerTransitionsCollector())
+            phase.register(ReturnFrontierCollector())
+            phase.register(CtreeStructureCollector())
+            phase.register(CompareChainCollector())
+            phase.register(FlowProfileClassifierCollector())
+            phase.register(FixPredSignalsCollector())
+            logger.info(
+                "ReconPhase enabled: %d collectors, db=%s",
+                phase.collector_count,
+                db_path,
+            )
+            return phase
+        except Exception as exc:
+            logger.warning("Failed to build recon pipeline: %s", exc)
+            return None
+
     def configure_instruction_optimizer(self, rules, **kwargs):
-        self.instruction_optimizer_rules = [rule for rule in rules]
+        self.instruction_optimizer_rules = list(rules)
         self.instruction_optimizer_config = kwargs
 
     def configure_block_optimizer(self, rules, **kwargs):
-        self.block_optimizer_rules = [rule for rule in rules]
+        self.block_optimizer_rules = list(rules)
         self.block_optimizer_config = kwargs
 
     def configure_ctree_optimizer(self, rules, **kwargs):
-        self.ctree_optimizer_rules = [rule for rule in rules]
+        self.ctree_optimizer_rules = list(rules)
         self.ctree_optimizer_config = kwargs
 
     def stop(self):
@@ -552,6 +803,12 @@ class D810Manager:
             except Exception:
                 pass
             self.storage = None
+        if self._recon_phase is not None:
+            try:
+                self._recon_phase._store.close()
+            except Exception:
+                pass
+            self._recon_phase = None
 
 
 @contextlib.contextmanager
@@ -615,7 +872,7 @@ class D810State(metaclass=SingletonMeta):
     @property
     def stats(self) -> OptimizationStatistics:
         """Forward stats access to the manager."""
-        if hasattr(self, 'manager') and self.manager is not None:
+        if hasattr(self, "manager") and self.manager is not None:
             return self.manager.stats
         # Return a fresh stats object if manager not yet initialized
         return OptimizationStatistics()
@@ -698,14 +955,23 @@ class D810State(metaclass=SingletonMeta):
                 **self.manager.instruction_optimizer_config,
                 rule_scope_service=self.manager.rule_scope_service,
                 rule_scope_project_name=self.current_project.path.name,
-                rule_scope_idb_key=str(cfg.get("idb_key", self.current_project.path.name)),
+                rule_scope_idb_key=str(
+                    cfg.get("idb_key", self.current_project.path.name)
+                ),
             )
             self.manager.block_optimizer.configure(
                 rule_scope_service=self.manager.rule_scope_service,
                 rule_scope_project_name=self.current_project.path.name,
-                rule_scope_idb_key=str(cfg.get("idb_key", self.current_project.path.name)),
+                rule_scope_idb_key=str(
+                    cfg.get("idb_key", self.current_project.path.name)
+                ),
             )
             self.manager._compile_rule_scope()
+        if getattr(self, "gui", None) is not None:
+            logger.info(
+                "d810-ng: Rules reconfigured for project %s",
+                self.current_project.path.name,
+            )
         logger.debug(
             "Loaded project %s (%s) from %s",
             self.current_project.path.name,
@@ -728,12 +994,12 @@ class D810State(metaclass=SingletonMeta):
             **self.current_project.additional_configuration,
         )
         self.manager.start()
-        print("D-810 ready to deobfuscate...")
+        logger.info("D-810 ready to deobfuscate...")
         self.d810_config.set("last_project_index", self.current_project_index)
         self.d810_config.save()
 
     def stop_d810(self):
-        print("Stopping D-810...")
+        logger.info("Stopping D-810...")
         self.manager.stop()
 
     def load(self, gui: bool = True):
@@ -787,6 +1053,7 @@ class D810State(metaclass=SingletonMeta):
         if gui and self._is_loaded:
             # Lazy import to avoid Qt dependency in headless mode
             from d810.ui.ida_ui import D810GUI
+
             self.gui = D810GUI(self)
             self.gui.show_windows()
 

@@ -1,6 +1,6 @@
 import ctypes
 
-from d810.core import MOP_CONSTANT_CACHE, MOP_TO_AST_CACHE
+from d810.cache import CacheImpl
 from d810.hexrays.hexrays_helpers import MSB_TABLE
 
 CTYPE_SIGNED_TABLE = {
@@ -129,7 +129,14 @@ def __ROR8__(value: int, count: int) -> int:
     return __ror__(value, count, 64)
 
 
-# NOTE:
-# Keep these aliases for compatibility with existing imports (e.g. manager.py),
-# but the cache singletons live in d810.core so every subsystem shares the same
-# instances and statistics.
+MOP_CONSTANT_CACHE = CacheImpl(
+    max_size=20480,
+    survive_reload=True,
+    reload_key="_SHARED_MOP_CONSTANT_CACHE",
+)
+
+MOP_TO_AST_CACHE = CacheImpl(
+    max_size=20480,
+    survive_reload=True,
+    reload_key="_SHARED_MOP_TO_AST_CACHE",
+)

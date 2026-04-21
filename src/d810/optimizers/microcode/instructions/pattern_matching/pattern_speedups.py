@@ -15,9 +15,9 @@ from __future__ import annotations
 from d810.core import typing
 
 if typing.TYPE_CHECKING:
-    from d810.expr.p_ast import AstBase, AstConstant, AstLeaf, AstNode
+    from d810.hexrays.expr.p_ast import AstBase, AstConstant, AstLeaf, AstNode
 
-from d810.hexrays.mop_snapshot import MopSnapshot
+from d810.hexrays.ir.mop_snapshot import MopSnapshot
 
 
 # =========================================================================
@@ -200,7 +200,7 @@ class MatchBinding:
             try:
                 self.mop = MopSnapshot.from_mop(mop)
             except (AttributeError, TypeError):
-                # Mock/test object — store as-is (only non-mop_t objects reach here)
+                # Mock/test object - store as-is (only non-mop_t objects reach here)
                 self.mop = mop  # noqa: d810-no-borrowed-mop
         else:
             # Already a MopSnapshot - use ternary to satisfy ast-grep (safe pattern)

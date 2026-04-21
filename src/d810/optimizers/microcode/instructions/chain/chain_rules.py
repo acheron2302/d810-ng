@@ -3,9 +3,9 @@ from functools import reduce
 import ida_hexrays
 
 from d810.core import getLogger
-from d810.hexrays.hexrays_formatters import format_minsn_t
+from d810.hexrays.utils.hexrays_formatters import format_minsn_t
 from d810.core.bits import AND_TABLE, SUB_TABLE
-from d810.hexrays.hexrays_helpers import (
+from d810.hexrays.utils.hexrays_helpers import (
     equal_bnot_mop,
     equal_mops_ignore_size,
     structural_mop_hash,
@@ -155,7 +155,7 @@ class ChainSimplification(object):
                     # keep first occurrence only
                     index_removed.update(idxs[1:])
 
-        # Cross-bucket bnot only when needed for AND → zero
+        # Cross-bucket bnot only when needed for AND -> zero
         if self.opcode == ida_hexrays.m_and and not is_always_0:
             keys = list(bucket_reps.keys())
             for i in range(len(keys)):

@@ -33,8 +33,8 @@ from dataclasses import dataclass
 import ida_hexrays
 
 from d810.core import getLogger, typing
-from d810.hexrays.cfg_utils import safe_verify
-from d810.hexrays.hexrays_formatters import maturity_to_string
+from d810.hexrays.mutation.cfg_verify import safe_verify
+from d810.hexrays.utils.hexrays_formatters import maturity_to_string
 from d810.optimizers.microcode.flow.handler import FlowOptimizationRule, FlowRulePriority
 from d810.optimizers.microcode.handler import ConfigParam
 
@@ -49,7 +49,17 @@ class _RunKey:
 
 
 class MbaStatePreconditioner(FlowOptimizationRule):
-    """Bounded function-level preconditioning pass for MBA-heavy dispatchers."""
+    """Bounded function-level preconditioning pass for MBA-heavy dispatchers.
+
+    Gate operation mode mapping
+    ---------------------------
+    - ``require_unflattening_gate=True``  -> effectively ``GATE_ONLY``
+      (evaluate_unflattening_gate enforced; no planner influence).
+    - ``require_unflattening_gate=False`` -> effectively ``COLLECT_ONLY``
+      (gate skipped entirely; rule always runs if maturity matches).
+
+    See :class:`~d810.core.gate_modes.GateOperationMode`.
+    """
 
     CATEGORY = "Flow Preconditioning"
     DESCRIPTION = (
@@ -119,6 +129,9 @@ class MbaStatePreconditioner(FlowOptimizationRule):
             return False
         if self.require_unflattening_gate and self.flow_context is not None:
             gate = self.flow_context.evaluate_unflattening_gate()
+            # Record flow gate outcome
+            if hasattr(self.flow_context, 'report_outcome'):
+                self.flow_context.report_outcome(gate, "preconditioner_gate")
             if not gate.allowed:
                 if logger.debug_on:
                     logger.debug(
@@ -129,6 +142,17 @@ class MbaStatePreconditioner(FlowOptimizationRule):
                         gate.reason,
                     )
                 return False
+        elif not self.require_unflattening_gate:
+            # Gate: BYPASSED_CONFIG_DISABLED — require_unflattening_gate=False
+            # disables the structural gate via project configuration.
+            if logger.debug_on:
+                logger.debug(
+                    "Gate bypassed [config_disabled]: %s require_unflattening_gate=False "
+                    "for 0x%x at %s",
+                    self.__class__.__name__,
+                    int(mba.entry_ea or 0),
+                    maturity_to_string(self.current_maturity),
+                )
         return True
 
     @typing.override

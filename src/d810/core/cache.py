@@ -105,9 +105,9 @@ def LRI(cache: "Cache") -> None:
     Remove the *least-recently-inserted* (oldest) entry from *cache*.
 
     Unlike LRU, which is driven by access *time*, this eviction policy is
-    strictly FIFO: the element that has resided in the cache the longest—
-    independent of any subsequent accesses—is expelled first.  Internally the
-    cache keeps a second insertion-ordered linked list where the sentinel’s
+    strictly FIFO: the element that has resided in the cache the longest-
+    independent of any subsequent accesses-is expelled first.  Internally the
+    cache keeps a second insertion-ordered linked list where the sentinel's
     ``ins_next`` pointer refers to the oldest element.  Passing this link to
     :pymeth:`CacheImpl._kill` achieves the eviction.
 
@@ -379,11 +379,16 @@ class CacheImpl(Cache[K, V]):
                 link.lru_next = self._root
 
             if self._track_frequency:
-                lfu_pos = link.lfu_prev
-                while lfu_pos is not self._root and lfu_pos.hits <= link.hits:
-                    lfu_pos = lfu_pos.lfu_prev
+                # _root.lfu_prev = LFU (lowest hits, evicted first).
+                # New items are inserted at _root.lfu_prev (0 hits).
+                # After a hit, the item must move AWAY from _root.lfu_prev toward
+                # _root.lfu_next (MFU end).  Traverse lfu_next to find the first
+                # node with FEWER hits than link, then insert link just before it.
+                lfu_pos = link.lfu_next
+                while lfu_pos is not self._root and lfu_pos.hits >= link.hits:
+                    lfu_pos = lfu_pos.lfu_next
 
-                if link.lfu_prev is not lfu_pos:
+                if link.lfu_next is not lfu_pos:
                     link.lfu_prev.lfu_next = link.lfu_next
                     link.lfu_next.lfu_prev = link.lfu_prev
 

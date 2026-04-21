@@ -7,7 +7,7 @@ text-based filtering and emits signals when the user selects a rule.
 """
 from __future__ import annotations
 
-import logging
+from d810.core.logging import getLogger
 from d810.core import typing
 
 from d810.qt_shim import QtCore, QtWidgets, qt_flag_or, QColor, QBrush
@@ -15,7 +15,7 @@ from d810.qt_shim import QtCore, QtWidgets, qt_flag_or, QColor, QBrush
 if typing.TYPE_CHECKING:
     from d810.optimizers.microcode.handler import OptimizationRule
 
-logger = logging.getLogger("D810.ui.rule_tree")
+logger = getLogger("D810.ui.rule_tree")
 
 # Qt role used to store the rule object reference on tree items.
 try:
@@ -76,21 +76,21 @@ class RuleTreeWidget(QtWidgets.QWidget):
 
         # Enabled legend item
         enabled_label = QtWidgets.QLabel(
-            "<span style='color:#4CAF50'>●</span> Enabled", legend_widget
+            "<span style='color:#4CAF50'>*</span> Enabled", legend_widget
         )
         enabled_label.setStyleSheet("font-size: 10px")
         legend_layout.addWidget(enabled_label)
 
         # Disabled legend item
         disabled_label = QtWidgets.QLabel(
-            "<span style='color:#9E9E9E'>●</span> Disabled", legend_widget
+            "<span style='color:#9E9E9E'>*</span> Disabled", legend_widget
         )
         disabled_label.setStyleSheet("font-size: 10px")
         legend_layout.addWidget(disabled_label)
 
         # Configurable legend item
         configurable_label = QtWidgets.QLabel(
-            "⚙ Configurable", legend_widget
+            "* Configurable", legend_widget
         )
         configurable_label.setStyleSheet("font-size: 10px")
         legend_layout.addWidget(configurable_label)

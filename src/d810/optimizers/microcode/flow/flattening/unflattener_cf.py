@@ -13,10 +13,11 @@ import ida_pro
 import ida_xref
 
 from d810.core.logging import getLogger
-from d810.hexrays.cfg_utils import safe_verify
-from d810.hexrays.hexrays_formatters import format_minsn_t
-from d810.hexrays.hexrays_helpers import MicrocodeHelper, MicroInstruction, MicroOperand
-from d810.optimizers.microcode.flow.flattening.safeguards import should_apply_cfg_modifications
+from d810.hexrays.mutation.cfg_verify import safe_verify
+from d810.hexrays.utils.hexrays_formatters import format_minsn_t
+from d810.hexrays.utils.hexrays_helpers import MicrocodeHelper, MicroInstruction, MicroOperand
+from d810.optimizers.microcode.flow.flattening.safeguards import should_apply_bulk_cfg_modifications
+from d810.cfg.dominator import compute_dominators
 from d810.optimizers.microcode.handler import ConfigParam
 from d810.optimizers.microcode.flow.handler import FlowOptimizationRule
 
@@ -469,85 +470,61 @@ def split_mblocks_by_jcc_ending(
     return True, ends_with_jcc, non_jcc, jcc_dest, jcc_fall_through
 
 
-class deferred_graph_modifier_t:
+class CfUnflattenModifier:
     """
-    The "deferred graph modifier" records changes that the client wishes to make
-    to a given graph, but does not apply them immediately. Weird things could
-    happen if we were to modify a graph while we were iterating over it, so save
-    the modifications until we're done iterating over the graph.
+    Thin adapter class wrapping DeferredGraphModifier for CF unflattenening.
+
+    This adapter preserves the original API of the local deferred_graph_modifier_t
+    class while delegating to the central DeferredGraphModifier. This allows
+    incremental migration without changing caller code.
+
+    The original class did raw succset/predset manipulation, which is now handled
+    by DeferredGraphModifier._apply_goto_change() via queue_goto_change().
     """
 
-    class edgeinfo_t:
-        def __init__(self, src=-1, dst1=-1, dst2=-1):
-            self.src = src
-            self.dst1 = dst1
-            self.dst2 = dst2
-
-    def __init__(self):
-        self.clear()
+    def __init__(self, mba: ida_hexrays.mba_t):
+        from d810.hexrays.mutation.deferred_modifier import DeferredGraphModifier
+        self._mba = mba
+        self._deferred = DeferredGraphModifier(mba)
+        # Track queued changes for compatibility with original API (e.g., len(dgm.edges))
+        self.edges: list = []
 
     def clear(self):
-        self.edges = []
+        """Clear all queued modifications."""
+        self._deferred.reset()
+        self.edges.clear()
 
-    def add(self, src, dest):
+    def replace(self, src: int, old_dest: int, new_dest: int):
         """
-        Plan to add an edge
-        """
-        self.edges.append(deferred_graph_modifier_t.edgeinfo_t(src=src, dst2=dest))
+        Queue a replacement of edge src->old_dest with src->new_dest.
 
-    def replace(self, src, old_dest, new_dest):
+        Maps to DeferredGraphModifier.queue_goto_change().
         """
-        Plan to replace an edge from src->old_dest to src->new_dest
-        """
-        # If the edge was already planned to be replaced, replace the
-        # old destination with the new one
-        for e in self.edges:
-            if e.src == src and e.dst1 == old_dest:
-                old_dest = e.dst2
-        self.edges.append(
-            deferred_graph_modifier_t.edgeinfo_t(src=src, dst1=old_dest, dst2=new_dest)
+        self._deferred.queue_goto_change(
+            block_serial=src,
+            new_target=new_dest,
+            description=f"cf_unflatten: replace edge {src}->{old_dest} with {src}->{new_dest}",
         )
+        # Track for compatibility with original len(dgm.edges) checks
+        self.edges.append((src, old_dest, new_dest))
 
-    def apply(self, mba, cfi=None):
+    def change_goto(self, blk: ida_hexrays.mblock_t, old: int, new: int) -> bool:
         """
-        Apply the planned changes to the graph
-        """
+        Change the destination of a goto (or add a new goto) and queue the edge change.
 
-        # Iterate through the edges slated for removal or addition
-        for e in self.edges:
-            mb_src = mba.get_mblock(e.src)
-            if e.dst1 != -1:
-                mb_dst1 = mba.get_mblock(e.dst1)
-                mb_src.succset._del(mb_dst1.serial)
-                mb_dst1.predset._del(mb_src.serial)
-            mb_dst2 = mba.get_mblock(e.dst2)
-            mb_src.succset.push_back(mb_dst2.serial)
-            mb_dst2.predset.push_back(mb_src.serial)
-            if cfi == None:
-                logger.info(
-                    "Replaced edge (%d->%d) by (%d->%d)\n"
-                    % (e.src, e.dst1, e.src, e.dst2)
-                )
-            else:
-                if e.src in cfi.block_to_key.keys():
-                    logger.info(
-                        f"Replaced edge ({e.src}->{e.dst1}) by ({e.src}->{e.dst2}) BlockKey = {hex(cfi.block_to_key[e.src])}"
-                    )
-                else:
-                    logger.info(
-                        f"Replaced edge ({e.src}->{e.dst1}) by ({e.src}->{e.dst2}) BlockKey = {cfi.block_to_key}"
-                    )
-        return len(self.edges)
+        The original implementation modified the goto instruction immediately, then
+        queued the edge change. We preserve that behavior by modifying the instruction
+        immediately, then delegating to queue_goto_change().
 
-    def change_goto(self, blk, old, new):
-        """
-        Either change the destination of an existing goto, or add a new goto onto
-        the end of the block to the destination. Also, plan to modify the graph
-        structure later to reflect these changes.
-        """
+        Args:
+            blk: Block to modify
+            old: Old target block serial
+            new: New target block serial
 
+        Returns:
+            True if a change was made, False if the destination was already correct
+        """
         changed = True
-        disp_pred = blk.serial
 
         # If the last instruction isn't a goto, add a new one
         if blk.tail.opcode != ida_hexrays.m_goto:
@@ -566,6 +543,46 @@ class deferred_graph_modifier_t:
         if changed:
             self.replace(blk.serial, old, new)
         return changed
+
+    def apply(self, mba: ida_hexrays.mba_t, cfi=None) -> int:
+        """
+        Apply all queued modifications.
+
+        Args:
+            mba: MBA to modify (kept for API compatibility, uses self._mba)
+            cfi: Control flow info for logging (optional)
+
+        Returns:
+            Number of modifications applied
+        """
+        if not self._deferred.has_modifications():
+            return 0
+
+        # Log modifications with cfi context if available
+        if logger.debug_on and cfi:
+            for mod in self._deferred.modifications:
+                block_serial = mod.block_serial
+                old_target = None  # We don't track old target in the new API
+                new_target = mod.new_target
+
+                if block_serial in cfi.block_to_key.keys():
+                    logger.info(
+                        f"CF unflatten: edge ({block_serial}->{new_target}) "
+                        f"BlockKey = {hex(cfi.block_to_key[block_serial])}"
+                    )
+                else:
+                    logger.info(
+                        f"CF unflatten: edge ({block_serial}->{new_target})"
+                    )
+
+        # Apply all modifications via the central modifier
+        # The central modifier handles succset/predset manipulation internally
+        return self._deferred.apply(
+            run_optimize_local=False,  # CF unflattener does its own optimization
+            run_deep_cleaning=False,   # CF unflattener does its own verification
+            verify_each_mod=False,     # CF unflattener verifies after all changes
+            enable_snapshot_rollback=False,  # Not needed for CF unflattener
+        )
 
 
 class jz_info_t:
@@ -655,7 +672,7 @@ class SwitchInfo:
 
 class switch_state_collector_t(ida_hexrays.minsn_visitor_t):
     """
-    1) Records all m_xdu instructions (var → reg)
+    1) Records all m_xdu instructions (var -> reg)
     2) On m_jtbl, finds which reg is the index, then looks up any prior xdu to map
        that reg back to the original var.
     """
@@ -669,7 +686,7 @@ class switch_state_collector_t(ida_hexrays.minsn_visitor_t):
         ins = self.curins
 
         if ins.opcode == ida_hexrays.m_xdu:
-            # record dest_reg ← src_var
+            # record dest_reg * src_var
             self.xdu_map.append(MicroInstruction(ins))
 
         elif ins.opcode == ida_hexrays.m_jtbl:
@@ -941,7 +958,7 @@ class jz_mapper_t(ida_hexrays.minsn_visitor_t):
         return 0
 
 
-def compute_dominators(mba: ida_hexrays.mba_t) -> list[ida_hexrays.bitset_t]:
+def _compute_dominators_bitset(mba: ida_hexrays.mba_t) -> list[ida_hexrays.bitset_t]:
     """
     Compute dominator information for the function.
     :param mba: mba_t
@@ -1244,7 +1261,7 @@ class cf_flatten_info_t:
         # mba.for_all_topinsns(jzm)
 
         # Once we've found the "comparison" variable (op_max), also pull in
-        # the jump-table's own mapping of keys → blocks.
+        # the jump-table's own mapping of keys -> blocks.
         # for swi in switch_tbl_collector.switches:
         #     # only use the jump-table whose state_var matches our op_max
         #     if swi.state_var and swi.state_var.equal_mops(
@@ -1293,7 +1310,7 @@ class cf_flatten_info_t:
         self.which_func = ea
 
         # Compute the dominator information for this function and stash it
-        self.dom_info = compute_dominators(mba)
+        self.dom_info = _compute_dominators_bitset(mba)
 
         # Compute some more information from the dominators. Basically, once the
         # control flow dispatch switch has transferred control to the function's
@@ -1810,7 +1827,7 @@ class cf_unflattener_t:
             return changed
 
         # Create an object that allows us to modify the graph at a future point.
-        dgm = deferred_graph_modifier_t()
+        dgm = CfUnflattenModifier(mba)
         dirty_chains = False
 
         # if flag to run for multiple dispatchers is deactivated,
@@ -2019,7 +2036,7 @@ class cf_unflattener_t:
 
         num_redirected = len(dgm.edges)
         total_case_blocks = len(self.cfi.key_to_block)
-        if not should_apply_cfg_modifications(num_redirected, total_case_blocks, "cf"):
+        if not should_apply_bulk_cfg_modifications(num_redirected, total_case_blocks, "cf"):
             dgm.clear()
             changed = 0
         else:
@@ -2051,9 +2068,20 @@ class cf_unflattener_t:
 
 
 class UnflattenControlFlowRule(FlowOptimizationRule):
-    """
-    Removes opaque dispatcher-based control-flow flattening.
+    """Removes opaque dispatcher-based control-flow flattening.
+
     Ported from pyhrdeobv2 (Eidolon).
+
+    Gate policy — AUDIT_ONLY (cf unflattener, no flow context gate):
+    This rule extends ``FlowOptimizationRule`` directly (not
+    ``GenericUnflatteningRule``) and is architecturally separate from the
+    main Hodur/OLLVM unflattening pipeline. ``FlowMaturityContext`` is not
+    wired — doing so would be a large cross-cutting change out of scope.
+    The rule uses its own safeguard via ``should_apply_bulk_cfg_modifications()``
+    at the apply phase.
+
+    Gate operation mode: ``COLLECT_ONLY`` equivalent.
+    See :class:`~d810.core.gate_modes.GateOperationMode`.
     """
 
     CATEGORY = "OLLVM Unflattening"

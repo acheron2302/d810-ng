@@ -9,10 +9,10 @@ located in `.rdata` / `.rodata`) with an immediate load (`ldc`).
 It handles two microcode patterns Hex-Rays emits:
 
 1. Direct displacement load (array access)
-   ldx  &($sym).8, #off        ──▶  ldc  #value
+   ldx  &($sym).8, #off        ***  ldc  #value
 
 2. Direct global variable load (OLLVM opaque table reads)
-   mov  $dword_XXXX.4, tmp.4   ──▶  ldc  #value
+   mov  $dword_XXXX.4, tmp.4   ***  ldc  #value
 
 By eliminating the table look-up, we unlock many more constant-folding
 opportunities in later optimisation stages.
@@ -22,13 +22,13 @@ opportunities in later optimisation stages.
 
 Add support for indirect load through a temporary register
    mov  &($sym).8, rax.8
-   xdu  [ds:(rax.8+#off)].1 …   ──▶  ldc  #value
+   xdu  [ds:(rax.8+#off)].1 ...   ***  ldc  #value
    
 def _ea_from_indirect_load(
     self, blk: ida_hexrays.mblock_t | None, ins: ida_hexrays.minsn_t
 ) -> Optional[int]:
     # Handle loads where base address is in a register that earlier got
-    # its value from   mov &sym → reg   inside the **same basic block**.
+    # its value from   mov &sym -> reg   inside the **same basic block**.
     # Expect operand of the form  [ reg + const ]  in DS segment.
     if ins.l.t != ida_hexrays.mop_b:
         return None
@@ -76,17 +76,73 @@ from d810.core.typing import Optional
 import ida_hexrays
 import ida_segment
 import idaapi
+from d810.evaluator.evaluators import evaluate_concrete
+
+# Opcodes where the right operand (shift amount) must have size == 1.
+# Folding a constant into ins.r with a larger size triggers INTERR 50835.
+# Mirrors the same set in forward_const_prop.py.
+_SHIFT_OPCODES: frozenset[int] = frozenset({
+    ida_hexrays.m_shl, ida_hexrays.m_shr, ida_hexrays.m_sar,
+})
 
 import d810.core.typing as typing
 from d810.core import getLogger
-from d810.hexrays.hexrays_helpers import extract_literal_from_mop
-from d810.hexrays.ida_utils import is_never_written_var
+from d810.errors import AstEvaluationException
+from d810.hexrays.ir.mop_utils import mop_to_ast
+from d810.hexrays.utils.hexrays_helpers import extract_literal_from_mop
+from d810.hexrays.utils.ida_utils import is_never_written_var
 from d810.optimizers.microcode.handler import ConfigParam
 from d810.optimizers.microcode.instructions.peephole.handler import (
     PeepholeSimplificationRule,
 )
 
 peephole_logger = getLogger(__name__)
+
+
+def _try_eval_pure_const_mop(mop: ida_hexrays.mop_t) -> Optional[int]:
+    """Try to evaluate *mop* as a pure-constant expression tree.
+
+    If *mop* is ``mop_n`` (an immediate constant), return its value directly.
+
+    If *mop* is ``mop_d`` (the result of a sub-instruction), convert it to an
+    AST via :func:`~d810.hexrays.expr.p_ast.mop_to_ast` and verify that every leaf in
+    the tree is a constant.  When that holds, evaluate the tree with an empty
+    variable dict (constants evaluate without any variable bindings) and return
+    the resulting integer.
+
+    Returns *None* if evaluation is not possible (non-constant leaves, AST
+    build failure, or any other error).
+    """
+    if mop is None:
+        return None
+
+    # Fast path: already an immediate constant.
+    if mop.t == ida_hexrays.mop_n:
+        return mop.nnn.value
+
+    # Only attempt AST evaluation for computed sub-expressions.
+    if mop.t != ida_hexrays.mop_d:
+        return None
+
+    try:
+        ast = mop_to_ast(mop)
+        if ast is None:
+            return None
+
+        # Verify all leaves are constants — if any leaf is a non-constant
+        # (e.g. a register or stack variable), we cannot evaluate statically.
+        leaves = ast.get_leaf_list()
+        if not leaves:
+            return None
+        if not all(leaf.is_constant() for leaf in leaves):
+            return None
+
+        result = evaluate_concrete(ast, {})
+        if result is None:
+            return None
+        return int(result)
+    except (AstEvaluationException, Exception):
+        return None
 
 
 # Operand types that may reference readonly global data.
@@ -137,6 +193,7 @@ class FoldReadonlyDataRule(PeepholeSimplificationRule):
             ida_hexrays.MMAT_LOCOPT,
             ida_hexrays.MMAT_CALLS,
             getattr(ida_hexrays, "MMAT_GLBOPT1", ida_hexrays.MMAT_CALLS),
+            getattr(ida_hexrays, "MMAT_GLBOPT3", ida_hexrays.MMAT_CALLS),
         ]
         # Configuration for segment permission checking
         # On Mach-O binaries (macOS/iOS), __const segments often have R+X
@@ -247,7 +304,7 @@ class FoldReadonlyDataRule(PeepholeSimplificationRule):
             # Try folding readonly globals used as plain values inside
             # expression trees (e.g., nested under mop_d). Do NOT fold top-level
             # mov of addresses (e.g., function pointers / IAT entries) into
-            # immediates – that breaks call-site rendering.
+            # immediates - that breaks call-site rendering.
             expr_folded = self._fold_readonly_operands_in_expr(ins)
             return expr_folded
 
@@ -312,6 +369,9 @@ class FoldReadonlyDataRule(PeepholeSimplificationRule):
         Supported forms::
 
             ldx  &sym , #off
+            ldx  &sym , <pure-const-expr>
+            ldx  $global_var , #off
+            ldx  $global_var , <pure-const-expr>
             ldx  ds ,  add(&sym , #off)
         """
 
@@ -320,11 +380,41 @@ class FoldReadonlyDataRule(PeepholeSimplificationRule):
 
         # ------------------------------------------------------------------
         #  Variant A:   ldx  &sym , #off
+        #  Variant A':  ldx  &sym , <pure-const-expr>
         # ------------------------------------------------------------------
-        if ins.l.t == ida_hexrays.mop_S and ins.r.t == ida_hexrays.mop_n:
-            base = ins.l.s.start_ea
-            off = ins.r.nnn.value
-            return base + off
+        if ins.l.t == ida_hexrays.mop_S:
+            if ins.r.t == ida_hexrays.mop_n:
+                base = ins.l.s.start_ea
+                off = ins.r.nnn.value
+                return base + off
+            # Variant A': index is a computed expression — try evaluating it
+            # as a pure-constant tree (all leaves are immediates).
+            if ins.r.t == ida_hexrays.mop_d:
+                off = _try_eval_pure_const_mop(ins.r)
+                if off is not None:
+                    base = ins.l.s.start_ea
+                    return base + off
+
+        # ------------------------------------------------------------------
+        #  Variant A'': ldx  $global_var , #off
+        #  Variant A''': ldx  $global_var , <pure-const-expr>
+        #
+        #  Handles table lookups like g_encDataRandomTable[constant_index]
+        #  where the base address comes from a direct global variable (mop_v).
+        #  The .g attribute of a mop_v operand holds the global EA directly.
+        # ------------------------------------------------------------------
+        if ins.l.t == ida_hexrays.mop_v:
+            if ins.r.t == ida_hexrays.mop_n:
+                base = ins.l.g
+                off = ins.r.nnn.value
+                return base + off
+            # Variant A''': index is a computed expression — try evaluating it
+            # as a pure-constant tree (all leaves are immediates).
+            if ins.r.t == ida_hexrays.mop_d:
+                off = _try_eval_pure_const_mop(ins.r)
+                if off is not None:
+                    base = ins.l.g
+                    return base + off
 
         # ------------------------------------------------------------------
         #  Variant B:   ldx  ds , add(&sym , #off)
@@ -346,7 +436,7 @@ class FoldReadonlyDataRule(PeepholeSimplificationRule):
                     adr_op, cnst_op = add_ins.r, add_ins.l
                 else:
                     return None
-            # adr_op is mop_a  →  resolve the inner symbol.
+            # adr_op is mop_a  ->  resolve the inner symbol.
             inner = adr_op.a
             if inner.t == ida_hexrays.mop_v:
                 base = inner.g
@@ -427,7 +517,19 @@ class FoldReadonlyDataRule(PeepholeSimplificationRule):
             changed |= self._fold_readonly_inplace(new_ins.r)
         # do not touch destination
 
-        return new_ins if changed else None
+        if not changed:
+            return None
+
+        # Post-fixup: shift instructions (m_shl/m_shr/m_sar) require that
+        # ins.r (the shift-amount operand) has size == 1.  If the recursive
+        # fold just replaced ins.r with a mop_n of a larger size, IDA's
+        # verifier will raise INTERR 50835.  Clamp the size here.
+        if new_ins.opcode in _SHIFT_OPCODES:
+            r = new_ins.r
+            if r is not None and r.t == ida_hexrays.mop_n and r.size != 1:
+                r.make_number(r.nnn.value & 0xFF, 1)
+
+        return new_ins
 
     def _fold_readonly_inplace(self, op: ida_hexrays.mop_t) -> bool:
         """Recursively fold `op` if it references a readonly global.

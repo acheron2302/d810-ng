@@ -9,7 +9,7 @@ import ida_hexrays
 import idc
 
 from d810.core import getLogger, Registrant
-from d810.hexrays.hexrays_formatters import maturity_to_string
+from d810.hexrays.utils.hexrays_formatters import maturity_to_string
 from d810.optimizers.microcode.handler import ConfigParam, DEFAULT_FLOW_MATURITIES, OptimizationRule
 
 logger = getLogger("D810.optimizer")
@@ -72,6 +72,7 @@ class FlowOptimizationRule(OptimizationRule, Registrant, abc.ABC):
     def __init__(self):
         super().__init__()
         self._current_maturity = ida_hexrays.MMAT_ZERO
+        self.current_generation: int = 0
         self.maturities = DEFAULT_FLOW_MATURITIES
         self.priority = self.PRIORITY
         self.flow_context: FlowMaturityContext | None = None

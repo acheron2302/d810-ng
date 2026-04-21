@@ -173,7 +173,7 @@ class D810ContextMenu:
 
         for instance in self._action_instances:
             action_cls = type(instance)
-            ida_handler = make_ida_handler(instance, ida_kernwin_module=ida_kernwin)
+            ida_handler = make_ida_handler(instance, idaapi_module=idaapi)
             desc = ida_kernwin.action_desc_t(
                 action_cls.ACTION_ID,
                 action_cls.ACTION_TEXT,
@@ -313,20 +313,9 @@ class D810ContextMenu:
     @staticmethod
     def _collect_ida_modules() -> dict[str, typing.Any]:
         modules: dict[str, typing.Any] = {}
-        for module_name in (
-            "idaapi",
-            "ida_kernwin",
-            "ida_hexrays",
-            "ida_loader",
-            "ida_funcs",
-            "ida_fpro",
-            "ida_lines",
-            "ida_name",
-            "ida_bytes",
-            "idc",
-        ):
-            try:
-                modules[module_name] = __import__(module_name)
-            except ImportError:
-                continue
+        # Only inject the idaapi shim; other modules are resolved on-demand.
+        try:
+            modules["idaapi"] = __import__("idaapi")
+        except ImportError:
+            pass
         return modules

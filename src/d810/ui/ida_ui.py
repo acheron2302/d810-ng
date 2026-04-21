@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import logging
 import pathlib
 
 import ida_kernwin
 import idaapi
 
-from d810.core import typing
+from d810.core import logging, typing
 from d810.qt_shim import QFrame, QGroupBox, QMenu, QtCore, QtGui, QToolButton, QtWidgets
 
 if typing.TYPE_CHECKING:
@@ -57,7 +56,7 @@ class LoggingConfigDialog(QtWidgets.QDialog):
 
     def __init__(self, module_prefix: str, parent: QtWidgets.QWidget | None = None):
         super().__init__(parent)
-        self.setWindowTitle(f"Logging for {module_prefix}…")
+        self.setWindowTitle(f"Logging for {module_prefix}...")
         self.setMinimumSize(700, 500)
         self.resize(800, 500)
 
@@ -79,7 +78,7 @@ class LoggingConfigDialog(QtWidgets.QDialog):
         self._filter_edit.textChanged.connect(self._apply_filter)
         top_row.addWidget(self._filter_edit, stretch=1)
 
-        self._set_all_btn = QtWidgets.QPushButton("Set All ▼")
+        self._set_all_btn = QtWidgets.QPushButton("Set All *")
         self._set_all_btn.setToolTip("Set all visible loggers to the same level")
         self._set_all_menu = QMenu(self._set_all_btn)
         for level_name in self.LOG_LEVELS:
@@ -636,7 +635,7 @@ class D810ConfigForm_t(ida_kernwin.PluginForm):
         rules_content_layout.setContentsMargins(0, 0, 0, 0)
         rules_content_layout.setSpacing(6)
 
-        # Edit header (name + description) — shown only for new/duplicate
+        # Edit header (name + description) - shown only for new/duplicate
         self._edit_header = QtWidgets.QWidget()
         rules_content_layout.addWidget(self._edit_header)
 
@@ -753,12 +752,12 @@ class D810ConfigForm_t(ida_kernwin.PluginForm):
             return
         if loaded:
             self._status_indicator.setText(
-                '<span style="color: #4CAF50; font-size: 20px;">●</span>'
+                '<span style="color: #4CAF50; font-size: 20px;">*</span>'
             )
             self._status_indicator.setToolTip("D810 is running")
         else:
             self._status_indicator.setText(
-                '<span style="color: #D32F2F; font-size: 20px;">●</span>'
+                '<span style="color: #D32F2F; font-size: 20px;">*</span>'
             )
             self._status_indicator.setToolTip("D810 is stopped")
 
@@ -774,7 +773,7 @@ class D810ConfigForm_t(ida_kernwin.PluginForm):
 
     def _on_rule_toggled(self, rule, is_enabled: bool) -> None:
         """Track rule enable/disable state (already handled by the tree)."""
-        if logger.isEnabledFor(logging.DEBUG):
+        if logger.debug_on:
             logger.debug("Rule toggled: %s -> %s", rule.name, is_enabled)
 
     def _on_config_changed(self, param_name: str, value) -> None:
@@ -784,15 +783,27 @@ class D810ConfigForm_t(ida_kernwin.PluginForm):
             return
         cfg = self._rule_configs.setdefault(rule.name, {})
         cfg[param_name] = value
-        if logger.isEnabledFor(logging.DEBUG):
+        if logger.debug_on:
             logger.debug("Config stored: %s.%s = %s", rule.name, param_name, value)
 
     def update_cfg_select(self):
         logger.debug("Calling update_cfg_select")
         tmp = self.state.current_project_index
-        self.cfg_select.clear()
-        # Display basename for readability
-        self.cfg_select.addItems(self.state.project_manager.project_names())
+        # Prevent spurious _load_config calls while we rebuild the combo box.
+        was_blocked = self.cfg_select.blockSignals(True)
+        try:
+            self.cfg_select.clear()
+            # Display basename for readability
+            self.cfg_select.addItems(self.state.project_manager.project_names())
+        finally:
+            self.cfg_select.blockSignals(was_blocked)
+        if self.cfg_select.count() == 0:
+            self.cfg_select.setCurrentIndex(-1)
+            return
+        if tmp < 0:
+            tmp = 0
+        elif tmp >= self.cfg_select.count():
+            tmp = self.cfg_select.count() - 1
         self.cfg_select.setCurrentIndex(tmp)
 
     # =========================================================================
@@ -1007,14 +1018,30 @@ class D810ConfigForm_t(ida_kernwin.PluginForm):
 
     # Called when the edit combo is changed
     def _load_config(self, index: int):
+        projects = self.state.project_manager.projects()
+        if not projects:
+            logger.warning("No project configurations available to load.")
+            return
+        if index < 0 or index >= len(projects):
+            logger.warning(
+                "Ignoring _load_config with invalid index %s (available 0..%s)",
+                index,
+                len(projects) - 1,
+            )
+            return
         if logger.debug_on:
-            projects = self.state.project_manager.projects()
+            current_idx = self.state.current_project_index
+            current_name = (
+                projects[current_idx].path.name
+                if 0 <= current_idx < len(projects)
+                else "n/a"
+            )
             logger.debug(
                 "Calling _load_config with index %s (%s), current project index %s (%s)",
                 index,
                 projects[index].path.name,
-                self.state.current_project_index,
-                projects[self.state.current_project_index].path.name,
+                current_idx,
+                current_name,
             )
         project = self.state.load_project(index)
         self.cfg_description.setPlainText(project.description)

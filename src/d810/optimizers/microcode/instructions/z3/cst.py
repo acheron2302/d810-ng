@@ -5,9 +5,10 @@ import ida_hexrays
 from d810.core import typing
 from d810.core import getLogger
 from d810.errors import AstEvaluationException
-from d810.expr.ast import AstConstant, AstNode, AstProxy, minsn_to_ast
-from d810.expr.z3_utils import z3_check_mop_equality
-from d810.hexrays.hexrays_formatters import format_minsn_t
+from d810.hexrays.expr.ast import AstConstant, AstNode, AstProxy
+from d810.hexrays.ir.minsn_utils import minsn_to_ast
+from d810.backends.ast.z3 import Z3MopProver
+from d810.hexrays.utils.hexrays_formatters import format_minsn_t
 from d810.optimizers.microcode.instructions.z3.handler import Z3Rule
 
 logger = getLogger(__name__)
@@ -47,7 +48,7 @@ class Z3ConstantOptimization(Z3Rule):
         leaf_num = len(leaf_info_list)
 
         if (
-            leaf_num != 1
+            leaf_num > 1
             or len(opcodes) < self.min_nb_opcode
             or len(cst_leaf_values) < self.min_nb_constant
         ):
@@ -56,13 +57,12 @@ class Z3ConstantOptimization(Z3Rule):
         if logger.debug_on:
             logger.debug("Found candidate: %s", format_minsn_t(instruction))
         try:
-            val_0 = tmp.evaluate_with_leaf_info(leaf_info_list, [0])  # * leaf_num)
-            val_1 = tmp.evaluate_with_leaf_info(
-                leaf_info_list, [0xFFFFFFFF]
-            )  # * leaf_num)
+            from d810.evaluator.evaluators import probe_is_constant
+
+            is_const, val_0 = probe_is_constant(tmp, leaf_info_list)
             if logger.debug_on:
-                logger.debug("  val_0: %s, val_1: %s", val_0, val_1)
-            if val_0 != val_1 or tmp.mop is None:
+                logger.debug("  is_const: %s, val_0: %s", is_const, val_0)
+            if not is_const or tmp.mop is None:
                 return None
 
             # TODO(w00tzenheimer): if we're evaluating (evaluate_with_leaf_info) and the results are equal,
@@ -76,9 +76,9 @@ class Z3ConstantOptimization(Z3Rule):
             #   return new_instruction
             c_res_mop = ida_hexrays.mop_t()
             c_res_mop.make_number(val_0, tmp.mop.size or 1)
-            if z3_check_mop_equality(tmp.mop, c_res_mop):
+            if Z3MopProver().are_equal(tmp.mop, c_res_mop):
                 if logger.debug_on:
-                    logger.debug("  z3_check_mop_equality is equal")
+                    logger.debug("  Z3MopProver.are_equal confirmed equality")
 
                 tmp.add_constant_leaf("c_res", val_0, tmp.mop.size)
                 # TODO(w00tzenheimer): should we recompute caches so that leafs_by_name contains the new constant leaf?

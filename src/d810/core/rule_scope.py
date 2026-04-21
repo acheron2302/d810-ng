@@ -19,8 +19,9 @@ class RuleScopeEvent(enum.Enum):
     IDB_OVERLAY_RELOADED = "idb_overlay_reloaded"
     FUNCTION_OVERRIDE_UPDATED = "function_override_updated"
     FUNCTION_TAGS_UPDATED = "function_tags_updated"
-    RECIPE_APPLIED = "recipe_applied"
-    RECIPE_CLEARED = "recipe_cleared"
+    INFERENCE_APPLIED = "inference_applied"
+    INFERENCE_CLEARED = "inference_cleared"
+    HINTS_APPLIED = "hints_applied"
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +75,36 @@ class RuleScopeCaches:
     active_by_scope: dict[ScopeKey, ActiveRuleBundle] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class RuleDelta:
+    """A single rule adjustment inferred from recon analysis.
+
+    Represents a diff from baseline rule behavior for a specific function.
+    Deltas are ephemeral by default (applied per-decompilation via
+    ``apply_hints``) and can be persisted to project config via the
+    ``persist_inference`` action.
+
+    Precedence (highest to lowest):
+        1. User ``per_function_overrides`` in project JSON
+        2. User ``whitelisted_functions`` / ``blacklisted_functions``
+        3. Inference ``override`` deltas (this type, runtime)
+        4. Inference ``suppress``/``activate`` deltas (this type, runtime)
+        5. Global rule config defaults
+
+    Actions:
+        - ``"suppress"``: Disable the rule for this function.
+        - ``"activate"``: Force-enable the rule for this function.
+        - ``"override"``: Apply parameter overrides from ``overrides`` dict.
+
+    The naming choice of "inference" reflects that these adjustments are
+    *derived from automated recon analysis*, not hand-authored presets.
+    "Delta" conveys a diff from baseline behavior.
+    """
+    rule_name: str
+    action: str                 # "suppress" | "activate" | "override"
+    overrides: dict[str, Any]   # {} for suppress/activate; key:value for override
+
+
 @dataclass(frozen=True, slots=True)
 class FunctionRuleOverlay:
     enabled_rules: frozenset[str] = frozenset()
@@ -82,7 +113,7 @@ class FunctionRuleOverlay:
 
 
 @dataclass(frozen=True, slots=True)
-class RuleRecipeOverlay:
+class RuleInferenceOverlay:
     name: str
     enabled_rules: frozenset[str] = frozenset()
     disabled_rules: frozenset[str] = frozenset()
@@ -92,8 +123,162 @@ class RuleRecipeOverlay:
     notes: str = ""
 
 
+InferenceFactory = Callable[[Any], list[RuleDelta]]
+"""Callable that, given analysis context, produces a list of RuleDelta adjustments."""
+
+
 class FunctionRuleOverlayProvider(Protocol):
     def __call__(self, function_ea: int) -> FunctionRuleOverlay | None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ApplyHintsResult:
+    """Records what changed when ``RuleScopeService.apply_hints()`` ran.
+
+    Attributes:
+        func_ea: Function address the hints targeted.
+        inferences_applied: Names of inferences that were activated.
+        inferences_not_found: Names requested but not in the inference registry.
+        rules_suppressed: Rule names that were added to the overlay's
+            disabled set for this function.
+        cache_invalidated: Whether the scope cache was invalidated.
+        generation_before: Service generation before the hints were applied.
+        generation_after: Service generation after the hints were applied.
+    """
+    func_ea: int
+    inferences_applied: tuple[str, ...]
+    inferences_not_found: tuple[str, ...]
+    rules_suppressed: tuple[str, ...]
+    cache_invalidated: bool
+    generation_before: int
+    generation_after: int
+
+
+class HintOverlayProvider:
+    """Overlay provider that merges hint-driven suppressions with a delegate.
+
+    Implements the ``FunctionRuleOverlayProvider`` protocol. For each
+    function EA, it returns the union of:
+
+    - Any overlay from the *delegate* provider (if set), and
+    - Hint-driven rule suppressions registered via ``suppress_rules()``.
+
+    This provider composes with (not replaces) any pre-existing overlay
+    provider on the ``RuleScopeService``.
+    """
+
+    def __init__(
+        self,
+        delegate: FunctionRuleOverlayProvider | None = None,
+    ) -> None:
+        self._delegate = delegate
+        self._suppressions: dict[int, frozenset[str]] = {}
+        self._hint_inferences: dict[int, list[RuleInferenceOverlay]] = {}
+
+    @property
+    def delegate(self) -> FunctionRuleOverlayProvider | None:
+        return self._delegate
+
+    def suppress_rules(
+        self,
+        func_ea: int,
+        rule_names: frozenset[str],
+    ) -> None:
+        """Register rule suppressions for a function.
+
+        Args:
+            func_ea: Target function address.
+            rule_names: Rule names to disable for this function.
+        """
+        existing = self._suppressions.get(func_ea, frozenset())
+        self._suppressions[func_ea] = existing | rule_names
+
+    def has_suppressions(self, func_ea: int) -> bool:
+        """Check whether any hint-driven suppressions exist for *func_ea*."""
+        return bool(self._suppressions.get(func_ea))
+
+    def get_suppressions(self, func_ea: int) -> frozenset[str]:
+        """Return hint-owned suppressions for *func_ea* (excludes delegate)."""
+        return self._suppressions.get(func_ea, frozenset())
+
+    def clear_func(self, func_ea: int) -> None:
+        """Remove all hint-driven inferences and suppressions for a function."""
+        self._hint_inferences.pop(func_ea, None)
+        self._suppressions.pop(func_ea, None)
+
+    def clear_suppressions(self, func_ea: int | None = None) -> None:
+        """Remove suppressions for *func_ea*, or all if ``None``."""
+        if func_ea is None:
+            self._suppressions.clear()
+        else:
+            self._suppressions.pop(func_ea, None)
+
+    def add_inference(self, func_ea: int, inference: RuleInferenceOverlay) -> None:
+        """Register a hint-driven inference activation for a function.
+
+        Multiple inferences for the same function accumulate; their
+        ``enabled_rules`` and ``disabled_rules`` are merged at query time.
+
+        Args:
+            func_ea: Target function address.
+            inference: Inference overlay to activate for this function.
+        """
+        self._hint_inferences.setdefault(func_ea, []).append(inference)
+
+    def get_hint_inferences(self, func_ea: int) -> list[RuleInferenceOverlay]:
+        """Return all hint-driven inferences registered for *func_ea*."""
+        return self._hint_inferences.get(func_ea, [])
+
+    def merged_hint_inference(self, func_ea: int) -> RuleInferenceOverlay | None:
+        """Return a single merged inference for *func_ea*, or ``None``.
+
+        Merges all per-function hint inferences into one overlay whose
+        ``enabled_rules`` and ``disabled_rules`` are the union of all
+        registered inferences.
+        """
+        inferences = self._hint_inferences.get(func_ea)
+        if not inferences:
+            return None
+        if len(inferences) == 1:
+            return inferences[0]
+        merged_enabled: set[str] = set()
+        merged_disabled: set[str] = set()
+        names: list[str] = []
+        for r in inferences:
+            merged_enabled.update(r.enabled_rules)
+            merged_disabled.update(r.disabled_rules)
+            names.append(r.name)
+        return RuleInferenceOverlay(
+            name="+".join(names),
+            enabled_rules=frozenset(merged_enabled),
+            disabled_rules=frozenset(merged_disabled),
+            target_func_eas=frozenset({func_ea}),
+        )
+
+    def __call__(self, function_ea: int) -> FunctionRuleOverlay | None:
+        delegate_overlay = (
+            self._delegate(function_ea) if self._delegate is not None else None
+        )
+        hint_disabled = self._suppressions.get(function_ea, frozenset())
+
+        if delegate_overlay is None and not hint_disabled:
+            return None
+
+        base_enabled = (
+            delegate_overlay.enabled_rules if delegate_overlay else frozenset()
+        )
+        base_disabled = (
+            delegate_overlay.disabled_rules if delegate_overlay else frozenset()
+        )
+        base_tags = (
+            delegate_overlay.function_tags if delegate_overlay else frozenset()
+        )
+
+        return FunctionRuleOverlay(
+            enabled_rules=base_enabled,
+            disabled_rules=base_disabled | hint_disabled,
+            function_tags=base_tags,
+        )
 
 
 class RuleScopeService:
@@ -111,7 +296,9 @@ class RuleScopeService:
         self._attached = False
         self._overlay_provider: FunctionRuleOverlayProvider | None = None
         self._overlay_cache: dict[int, FunctionRuleOverlay | None] = {}
-        self._active_recipe: RuleRecipeOverlay | None = None
+        self._active_inference: RuleInferenceOverlay | None = None
+        self._inference_registry: dict[str, InferenceFactory] = {}
+        self._hint_overlay: HintOverlayProvider | None = None
 
     @property
     def generation(self) -> int:
@@ -137,6 +324,7 @@ class RuleScopeService:
         partial_reasons = {
             RuleScopeEvent.FUNCTION_OVERRIDE_UPDATED,
             RuleScopeEvent.FUNCTION_TAGS_UPDATED,
+            RuleScopeEvent.HINTS_APPLIED,
         }
         if payload.reason in partial_reasons and payload.func_eas:
             self._invalidate_functions(payload.func_eas)
@@ -177,8 +365,215 @@ class RuleScopeService:
         self._overlay_provider = provider
         self._overlay_cache.clear()
 
-    def set_active_recipe(self, recipe: RuleRecipeOverlay | None) -> None:
-        self._active_recipe = recipe
+    def set_active_inference(self, inference: RuleInferenceOverlay | None) -> None:
+        self._active_inference = inference
+
+    def register_inference(self, name: str, factory: InferenceFactory) -> None:
+        """Register a named inference factory for later invocation by ``apply_hints()``.
+
+        Args:
+            name: Inference name used as registry key.
+            factory: Callable that accepts analysis context and returns
+                a list of :class:`RuleDelta` adjustments.
+        """
+        self._inference_registry[name] = factory
+
+    def get_registered_inference(self, name: str) -> InferenceFactory | None:
+        """Look up an inference factory by name from the registry.
+
+        Args:
+            name: Inference name to look up.
+
+        Returns:
+            The registered factory, or ``None`` if not found.
+        """
+        return self._inference_registry.get(name)
+
+    def get_hint_state_summary(self, func_ea: int) -> dict:
+        """Return a summary of hint-driven state for a function.
+
+        Provides activation observability without a full reporting surface.
+
+        Args:
+            func_ea: Function address to query.
+
+        Returns:
+            Dictionary with keys ``func_ea``, ``has_hint_inferences``,
+            ``inference_names``, ``suppressed_rules``, ``generation``.
+        """
+        has_inferences = False
+        inference_names: list[str] = []
+        suppressed: list[str] = []
+
+        if self._hint_overlay is not None:
+            hint_inferences = self._hint_overlay.get_hint_inferences(func_ea)
+            has_inferences = bool(hint_inferences)
+            inference_names = [r.name for r in hint_inferences]
+
+            # Read only hint-owned suppressions (not delegate overlay)
+            hint_suppressed = self._hint_overlay.get_suppressions(func_ea)
+            if hint_suppressed:
+                suppressed = sorted(hint_suppressed)
+
+        return {
+            "func_ea": func_ea,
+            "has_hint_inferences": has_inferences,
+            "inference_names": inference_names,
+            "suppressed_rules": suppressed,
+            "generation": self._generation,
+        }
+
+    def clear_hint_state(self, func_ea: int) -> None:
+        """Clear all hint-driven inferences and suppressions for *func_ea*.
+
+        Delegates to ``HintOverlayProvider.clear_func()`` and invalidates
+        caches so subsequent ``get_active_rules()`` calls see the removal.
+        """
+        if self._hint_overlay is not None:
+            self._hint_overlay.clear_func(func_ea)
+            self.invalidate(
+                RuleScopeInvalidation(
+                    reason=RuleScopeEvent.HINTS_APPLIED,
+                    func_eas=frozenset({func_ea}),
+                )
+            )
+
+    def apply_hints(self, hints: Any) -> ApplyHintsResult:
+        """Apply analysed deobfuscation hints to rule scope configuration.
+
+        Bridges ``DeobfuscationHints`` -> overlay/inference activation.
+        Accepts any object with ``func_ea``, ``recommended_inferences``,
+        and ``suppress_rules`` attributes (duck-typed to avoid a hard
+        import of ``d810.recon.models``).
+
+        Args:
+            hints: Analysed hints from AnalysisPhase.
+
+        Returns:
+            ``ApplyHintsResult`` recording what changed.
+        """
+        func_ea: int = hints.func_ea
+        recommended_inferences: tuple[str, ...] = hints.recommended_inferences
+        suppress_rules: tuple[str, ...] = hints.suppress_rules
+
+        generation_before = self._generation
+        inferences_applied: list[str] = []
+        inferences_not_found: list[str] = []
+
+        # --- 0. Clear previous hint state for this function ------------------
+        # Each call is a full replace, not an append: a later call with
+        # empty/different hints for the same func_ea retracts earlier decisions.
+        had_previous_state = False
+        if self._hint_overlay is not None:
+            had_previous_state = (
+                bool(self._hint_overlay.get_hint_inferences(func_ea))
+                or self._hint_overlay.has_suppressions(func_ea)
+            )
+            self._hint_overlay.clear_func(func_ea)
+
+        # --- 1. Apply recommended inferences ---------------------------------
+        for inference_name in recommended_inferences:
+            factory = self._inference_registry.get(inference_name)
+            if factory is None:
+                inferences_not_found.append(inference_name)
+                continue
+            # Invoke factory to get deltas, then convert to overlay
+            deltas = factory(hints)
+            logger.info(
+                "rule_inference: func=0x%x inference=%r produced %d delta(s)",
+                func_ea, inference_name, len(deltas),
+            )
+            enabled: set[str] = set()
+            disabled: set[str] = set()
+            for delta in deltas:
+                if delta.action == "activate":
+                    if self._user_config_overrides_delta(delta, func_ea):
+                        logger.warning(
+                            "rule_inference: func=0x%x delta activate(%s) -> "
+                            "overridden by user config (rule is blacklisted)",
+                            func_ea, delta.rule_name,
+                        )
+                    else:
+                        enabled.add(delta.rule_name)
+                        logger.info(
+                            "rule_inference: func=0x%x delta activate(%s) -> applied",
+                            func_ea, delta.rule_name,
+                        )
+                elif delta.action == "suppress":
+                    if self._user_config_overrides_delta(delta, func_ea):
+                        logger.warning(
+                            "rule_inference: func=0x%x delta suppress(%s) -> "
+                            "overridden by user config (rule is whitelisted)",
+                            func_ea, delta.rule_name,
+                        )
+                    else:
+                        disabled.add(delta.rule_name)
+                        logger.info(
+                            "rule_inference: func=0x%x delta suppress(%s) -> applied",
+                            func_ea, delta.rule_name,
+                        )
+            scoped = RuleInferenceOverlay(
+                name=inference_name,
+                enabled_rules=frozenset(enabled),
+                disabled_rules=frozenset(disabled),
+                target_func_eas=frozenset({func_ea}),
+            )
+            # Store per-function via HintOverlayProvider (not global _active_inference)
+            if self._hint_overlay is None:
+                self._hint_overlay = HintOverlayProvider(
+                    delegate=self._overlay_provider,
+                )
+                self._overlay_provider = self._hint_overlay
+                self._overlay_cache.clear()
+            self._hint_overlay.add_inference(func_ea, scoped)
+            inferences_applied.append(inference_name)
+
+        # --- 2. Apply suppress_rules via HintOverlayProvider -----------------
+        rules_suppressed: list[str] = []
+        if suppress_rules:
+            suppression_set = frozenset(suppress_rules)
+            # Lazily create the HintOverlayProvider, wrapping any existing
+            # provider as delegate.
+            if self._hint_overlay is None:
+                self._hint_overlay = HintOverlayProvider(
+                    delegate=self._overlay_provider,
+                )
+                self._overlay_provider = self._hint_overlay
+                self._overlay_cache.clear()
+            self._hint_overlay.suppress_rules(func_ea, suppression_set)
+            rules_suppressed = list(suppress_rules)
+
+        # --- 3. Invalidate caches for this function --------------------------
+        any_change = bool(inferences_applied) or bool(rules_suppressed) or had_previous_state
+        if any_change:
+            self.invalidate(
+                RuleScopeInvalidation(
+                    reason=RuleScopeEvent.HINTS_APPLIED,
+                    func_eas=frozenset({func_ea}),
+                    changed_rules=frozenset(rules_suppressed) or None,
+                )
+            )
+
+        generation_after = self._generation
+        result = ApplyHintsResult(
+            func_ea=func_ea,
+            inferences_applied=tuple(inferences_applied),
+            inferences_not_found=tuple(inferences_not_found),
+            rules_suppressed=tuple(rules_suppressed),
+            cache_invalidated=any_change,
+            generation_before=generation_before,
+            generation_after=generation_after,
+        )
+        if logger.debug_on:
+            logger.debug(
+                "apply_hints func_ea=0x%x: inferences=%s suppressed=%s gen=%d->%d",
+                func_ea,
+                result.inferences_applied,
+                result.rules_suppressed,
+                generation_before,
+                generation_after,
+            )
+        return result
 
     def compile_base_rules(
         self,
@@ -277,6 +672,14 @@ class RuleScopeService:
         if not names:
             return tuple()
 
+        # Determine the effective inference: per-function hint inference takes
+        # precedence over the global _active_inference for this function.
+        effective_inference = self._active_inference
+        if self._hint_overlay is not None:
+            hint_inference = self._hint_overlay.merged_hint_inference(func_ea)
+            if hint_inference is not None:
+                effective_inference = hint_inference
+
         active_for_maturity: list[Any] = []
         for rule_name in names:
             selector = compiled.selectors.get(f"{pipeline}:{rule_name}")
@@ -284,8 +687,8 @@ class RuleScopeService:
                 continue
             if not self._overlay_allows(overlay, rule_name):
                 continue
-            if not self._recipe_allows(
-                recipe=self._active_recipe,
+            if not self._inference_allows(
+                inference=effective_inference,
                 rule_name=rule_name,
                 func_ea=func_ea,
                 tags=effective_tags,
@@ -405,38 +808,72 @@ class RuleScopeService:
         return frozenset(normalized)
 
     @staticmethod
-    def _recipe_targets_function(
-        recipe: RuleRecipeOverlay,
+    def _inference_targets_function(
+        inference: RuleInferenceOverlay,
         *,
         func_ea: int,
         tags: frozenset[str],
     ) -> bool:
-        if recipe.target_func_eas and func_ea not in recipe.target_func_eas:
+        if inference.target_func_eas and func_ea not in inference.target_func_eas:
             return False
-        if recipe.target_tags_any and recipe.target_tags_any.isdisjoint(tags):
+        if inference.target_tags_any and inference.target_tags_any.isdisjoint(tags):
             return False
-        if recipe.target_tags_all and not recipe.target_tags_all.issubset(tags):
+        if inference.target_tags_all and not inference.target_tags_all.issubset(tags):
             return False
         return True
 
     @staticmethod
-    def _recipe_allows(
+    def _inference_allows(
         *,
-        recipe: RuleRecipeOverlay | None,
+        inference: RuleInferenceOverlay | None,
         rule_name: str,
         func_ea: int,
         tags: frozenset[str],
     ) -> bool:
-        if recipe is None:
+        if inference is None:
             return True
-        if not RuleScopeService._recipe_targets_function(
-            recipe,
+        if not RuleScopeService._inference_targets_function(
+            inference,
             func_ea=func_ea,
             tags=tags,
         ):
             return True
-        if recipe.enabled_rules and rule_name not in recipe.enabled_rules:
+        if inference.enabled_rules and rule_name not in inference.enabled_rules:
             return False
-        if rule_name in recipe.disabled_rules:
+        if rule_name in inference.disabled_rules:
             return False
         return True
+
+    def _user_config_overrides_delta(
+        self,
+        delta: RuleDelta,
+        func_ea: int,
+    ) -> bool:
+        """Check whether user config (whitelist/blacklist) would override a delta.
+
+        For ``suppress`` deltas: returns ``True`` if the rule has an
+        ``allow_eas`` whitelist containing *func_ea* (user explicitly
+        whitelisted this function for the rule).
+
+        For ``activate`` deltas: returns ``True`` if the rule has a
+        ``deny_eas`` blacklist containing *func_ea* (user explicitly
+        blacklisted this function from the rule).
+
+        Returns ``False`` if no compiled selectors exist or the rule is
+        not found in any pipeline.
+        """
+        compiled = self._caches.compiled
+        if compiled is None:
+            return False
+
+        # Selectors are keyed as "{pipeline}:{rule_name}"; check all pipelines.
+        for key, selector in compiled.selectors.items():
+            if selector.rule_name != delta.rule_name:
+                continue
+            if delta.action == "suppress":
+                if selector.allow_eas is not None and func_ea in selector.allow_eas:
+                    return True
+            elif delta.action == "activate":
+                if selector.deny_eas is not None and func_ea in selector.deny_eas:
+                    return True
+        return False

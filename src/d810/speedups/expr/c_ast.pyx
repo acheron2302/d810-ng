@@ -37,7 +37,6 @@ from d810.hexrays.hexrays_helpers import (
     is_rotate_helper_call,
     structural_mop_hash,
 )
-from d810.speedups.expr.c_ast_evaluate import AstEvaluator
 from d810.core import NOT_GIVEN
 
 logger = getLogger(__name__)
@@ -138,10 +137,6 @@ cdef class AstBase:
     @abc.abstractmethod
     def get_pattern(self) -> str:
         raise NotImplementedError("AstBase.get_pattern must be overridden")
-
-    @abc.abstractmethod
-    def evaluate(self, dict_index_to_value: dict[int, int]) -> int:
-        raise NotImplementedError("AstBase.evaluate must be overridden")
 
     @abc.abstractmethod
     def get_depth_signature(self, depth: int) -> list[str]:
@@ -411,14 +406,6 @@ cdef class AstNode(AstBase):
             )
         else:
             raise ValueError(f"Invalid number of operands: {nb_operands}")
-
-    def evaluate_with_leaf_info(
-        self, leafs_info: list[AstInfo], leafs_value: list[int]
-    ) -> int:
-        return _DEFAULT_AST_EVALUATOR.evaluate_with_leaf_info(self, leafs_info, leafs_value)
-
-    def evaluate(self, dict_index_to_value: dict[int, int]) -> int:
-        return _DEFAULT_AST_EVALUATOR.evaluate(self, dict_index_to_value)
 
     def get_depth_signature(self, int depth):
         # Check cache first (fast path for frozen nodes)
@@ -752,12 +739,6 @@ cdef class AstLeaf(AstBase):
         if self.name is not None:
             return "AstLeaf('{0}')".format(self.name)
 
-    def evaluate_with_leaf_info(self, leafs_info, leafs_value):
-        return _DEFAULT_AST_EVALUATOR.evaluate_with_leaf_info(self, leafs_info, leafs_value)
-
-    def evaluate(self, dict_index_to_value):
-        return _DEFAULT_AST_EVALUATOR.evaluate(self, dict_index_to_value)
-
     def get_depth_signature(self, int depth):
         # Check cache first
         cdef list cached = self._depth_sig_cache.get(depth)
@@ -839,11 +820,6 @@ cdef class AstConstant(AstLeaf):
             else:
                 return True
         return self.expected_value == other.mop.nnn.value
-
-    def evaluate(self, dict_index_to_value=None):
-        if self.mop is not None and self.mop.t == ida_hexrays.mop_n:
-            return self.mop.nnn.value
-        return self.expected_value
 
     def get_depth_signature(self, int depth):
         # Check cache first (inherited from AstLeaf)
@@ -1174,9 +1150,6 @@ cdef class AstConstant(AstLeaf):
 #             )
 
 
-_DEFAULT_AST_EVALUATOR = AstEvaluator()
-
-
 cdef class AstProxy(AstBase):
     cdef public AstBase _target
     cdef public bint _mutable
@@ -1316,10 +1289,6 @@ cdef class AstProxy(AstBase):
     @_compat.override
     def get_pattern(self) -> str:
         return self._target.get_pattern()
-
-    @_compat.override
-    def evaluate(self, dict_index_to_value: dict[int, int]) -> int:
-        return self._target.evaluate(dict_index_to_value)
 
     @_compat.override
     def get_depth_signature(self, depth: int) -> list[str]:
@@ -1509,9 +1478,83 @@ def mop_to_ast_internal(
         existing_index = context.mop_key_to_index[key]
         return context.unique_asts[existing_index]
 
-    # Rotate helper calls (__ROL*/__ROR*) are now inlined into plain shift/or
-    # instructions by RotateHelperInlineRule (peephole, MMAT_GLBOPT1).
-    # No special handling required here.
+    # Build AST nodes for rotate helper calls (__ROL*/__ROR*).
+    # These are m_call instructions with an mop_h callee.  RotateHelperInlineRule
+    # inlines them when both args are literals, but when the pipeline still sees
+    # them (e.g. Z3ConstantOptimization at an earlier maturity) we need to build
+    # a proper AstNode so that evaluate() can compute the result.
+    if (
+        mop.t == ida_hexrays.mop_d
+        and mop.d is not None
+        and is_rotate_helper_call(mop.d)
+    ):
+        call_ins = mop.d  # the inner m_call minsn_t
+
+        # Extract helper name from the callee operand (ins.l is mop_h)
+        helper_name = ""
+        if call_ins.l is not None and call_ins.l.t == ida_hexrays.mop_h:
+            helper_name = (call_ins.l.helper or "").lstrip("!")
+
+        if helper_name:
+            # Determine argument mops.  Hex-Rays uses two layouts:
+            #   Pattern A: args packed in mop_f stored in call_ins.r
+            #   Pattern B/C: value in call_ins.r, shift in call_ins.d (compact)
+            val_mop = None
+            rot_mop = None
+
+            if (
+                call_ins.r is not None
+                and call_ins.r.t == ida_hexrays.mop_f
+                and hasattr(call_ins.r, "f")
+                and call_ins.r.f is not None
+                and len(call_ins.r.f.args) >= 2
+            ):
+                val_mop = call_ins.r.f.args[0]
+                rot_mop = call_ins.r.f.args[1]
+            elif (
+                call_ins.d is not None
+                and call_ins.d.t == ida_hexrays.mop_f
+                and hasattr(call_ins.d, "f")
+                and call_ins.d.f is not None
+                and len(call_ins.d.f.args) >= 2
+            ):
+                val_mop = call_ins.d.f.args[0]
+                rot_mop = call_ins.d.f.args[1]
+            elif call_ins.r is not None and call_ins.d is not None:
+                val_mop = call_ins.r
+                rot_mop = call_ins.d
+
+            if val_mop is not None and rot_mop is not None:
+                left_ast = mop_to_ast_internal(val_mop, context)
+                right_ast = mop_to_ast_internal(rot_mop, context)
+
+                if left_ast is not None and right_ast is not None:
+                    tree = AstNode(ida_hexrays.m_call, left_ast, right_ast)
+                    tree.func_name = helper_name
+
+                    if hasattr(mop, "size") and mop.size:
+                        tree.dest_size = mop.size
+                    elif hasattr(call_ins, "size") and call_ins.size:
+                        tree.dest_size = call_ins.size
+                    else:
+                        tree.dest_size = None
+
+                    tree.mop = mop
+                    tree.ea = sanitize_ea(call_ins.ea)
+
+                    if logger.debug_on:
+                        logger.debug(
+                            "[mop_to_ast_internal] Created AstNode for rotate helper %s (ea=0x%X): %s",
+                            helper_name,
+                            call_ins.ea if hasattr(call_ins, "ea") else -1,
+                            tree,
+                        )
+
+                    new_index = len(context.unique_asts)
+                    tree.ast_index = new_index
+                    context.unique_asts.append(tree)
+                    context.mop_key_to_index[key] = new_index
+                    return tree
 
     # Helper calls that evaluate to constants are now canonicalised by
     # ConstantCallResultFoldRule (peephole GLBOPT1).
@@ -2004,13 +2047,13 @@ def minsn_to_ast(instruction: ida_hexrays.minsn_t) -> AstProxy | None:
         ins_mop = ida_hexrays.mop_t()
         ins_mop.create_from_insn(instruction)
 
-        # if instruction.opcode == ida_hexrays.m_mov:
-        #     tmp = AstNode(ida_hexrays.m_mov, mop_to_ast(ins_mop))
-        #     tmp.mop = ins_mop
-        #     tmp.dest_size = instruction.d.size
-        #     tmp.ea = instruction.ea
-        #     tmp.dst_mop = instruction.d
-        #     return tmp
+        if instruction.opcode == ida_hexrays.m_mov:
+            tmp = AstNode(ida_hexrays.m_mov, mop_to_ast(ins_mop))
+            tmp.mop = ins_mop
+            tmp.dest_size = instruction.d.size
+            tmp.ea = instruction.ea
+            tmp.dst_mop = instruction.d
+            return tmp
 
         tmp = mop_to_ast(ins_mop)
         if tmp is None:

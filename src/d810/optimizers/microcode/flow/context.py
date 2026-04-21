@@ -1,22 +1,24 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from d810.core.typing import TYPE_CHECKING
+from d810.core.typing import TYPE_CHECKING, Callable
 
 import ida_hexrays
 
 from d810.core import getLogger
-from d810.optimizers.microcode.flow.analysis_stats import (
+from d810.recon.flow.analysis_stats import (
     FlowProfileStats,
     compute_flow_profile_stats,
 )
-from d810.optimizers.microcode.flow.flattening.dispatcher_detection import (
+from d810.recon.flow.dispatcher_detection import (
     DispatcherCache,
     DispatcherType,
 )
+from d810.core.gate_modes import GateOperationMode
+from d810.recon.flow_hints import FlowContextHintSummary
 
 if TYPE_CHECKING:
-    from d810.optimizers.microcode.flow.flattening.dispatcher_detection import (
+    from d810.recon.flow.dispatcher_detection import (
         BlockAnalysis,
         DispatcherAnalysis,
     )
@@ -37,10 +39,17 @@ class FlowMaturityContext:
 
     MIN_FIXPRED_DISPATCHER_PREDS = 3
 
-    def __init__(self, mba: ida_hexrays.mba_t, func_ea: int, maturity: int):
+    def __init__(
+        self,
+        mba: ida_hexrays.mba_t,
+        func_ea: int,
+        maturity: int,
+        gate_mode: GateOperationMode = GateOperationMode.GATE_SELECT,
+    ):
         self.mba = mba
         self.func_ea = int(func_ea)
         self.maturity = int(maturity)
+        self.gate_mode = gate_mode
         self.phase_priority: int | None = None
         self.phase_index: int = 0
         self._dispatcher_analysis: DispatcherAnalysis | None = None
@@ -48,6 +57,42 @@ class FlowMaturityContext:
         self._profile_stats: FlowProfileStats | None = None
         self._profile_stats_error: Exception | None = None
         self._active_rule_names: tuple[str, ...] = tuple()
+        self._hint_summary: FlowContextHintSummary | None = None
+        self._outcome_callback: Callable[[int, object, str], None] | None = None
+
+    @property
+    def hint_summary(self) -> FlowContextHintSummary | None:
+        """Return the current flow-context hint summary, or ``None``."""
+        return self._hint_summary
+
+    def set_hint_summary(self, summary: FlowContextHintSummary) -> None:
+        """Attach an analyzed hint summary from the recon lifecycle.
+
+        The summary is used as an *additional* signal in gate evaluation
+        methods. It does not replace existing dispatcher-analysis logic.
+
+        In the live path, ``BlockOptimizerManager._attach_hint_summary``
+        calls this automatically when a new ``FlowMaturityContext`` is
+        created (including after invalidation). The summary is derived
+        from persisted ``DeobfuscationHints`` via
+        :func:`derive_flow_context_summary`.
+        """
+        self._hint_summary = summary
+
+    def set_outcome_callback(
+        self, callback: Callable[[int, object, str], None] | None,
+    ) -> None:
+        """Set a callback for recording consumer outcomes.
+
+        The callback signature is ``(func_ea, outcome_object, consumer_type)``
+        where *consumer_type* is ``"planner"`` or ``"flow_gate"``.
+        """
+        self._outcome_callback = callback
+
+    def report_outcome(self, outcome_object: object, consumer_type: str) -> None:
+        """Report a consumer outcome via the registered callback, if any."""
+        if self._outcome_callback is not None:
+            self._outcome_callback(self.func_ea, outcome_object, consumer_type)
 
     def refresh_mba(self, mba: ida_hexrays.mba_t) -> None:
         self.mba = mba
@@ -134,6 +179,32 @@ class FlowMaturityContext:
         return max_preds
 
     def evaluate_unflattening_gate(self) -> FlowGateDecision:
+        """Evaluate whether unflattening should proceed.
+
+        Gate operation mode
+        -------------------
+        - ``COLLECT_ONLY``: analysis still runs (for recon), but the gate
+          always returns ``allowed=True``.
+        - ``GATE_ONLY`` / ``GATE_SELECT``: analysis runs and the result
+          is enforced (fail-closed).
+        """
+        decision = self._evaluate_unflattening_gate_inner()
+        if not decision.allowed and not self.gate_mode.enforces_gate:
+            return FlowGateDecision(
+                True,
+                f"collect-only bypass (underlying: {decision.reason})",
+            )
+        return decision
+
+    def _evaluate_unflattening_gate_inner(self) -> FlowGateDecision:
+        """Core unflattening gate logic (mode-independent).
+
+        If a :class:`FlowContextHintSummary` is attached, its flattening
+        signal is used as an additional rescue: when the dispatcher
+        profile is too weak on its own but hints confirm flattening with
+        sufficient confidence (>= 0.5), the gate allows the rule to
+        proceed.  Existing positive decisions are never overridden.
+        """
         analysis = self.ensure_dispatcher_analysis()
         if analysis is None:
             return FlowGateDecision(False, "dispatcher analysis unavailable")
@@ -162,6 +233,21 @@ class FlowMaturityContext:
                         f"(scc={profile.dispatch_scc_n}, score={profile.flattening_score:.2f})"
                     ),
                 )
+            # Hint-rescue: if recon hints confirm flattening, allow despite
+            # weak profile.  This is additive — it never overrides a
+            # positive decision above.
+            if self._hint_summary is not None:
+                if (
+                    self._hint_summary.has_flattening_signal
+                    and self._hint_summary.confidence >= 0.5
+                ):
+                    return FlowGateDecision(
+                        True,
+                        (
+                            "unknown dispatcher rescued by recon hints "
+                            f"(confidence={self._hint_summary.confidence:.2f})"
+                        ),
+                    )
             return FlowGateDecision(
                 False,
                 (
@@ -172,6 +258,25 @@ class FlowMaturityContext:
         return FlowGateDecision(False, f"dispatcher_type={analysis.dispatcher_type.name}")
 
     def evaluate_fix_predecessor_gate(self) -> FlowGateDecision:
+        """Evaluate whether fix-predecessor optimization should proceed.
+
+        Gate operation mode
+        -------------------
+        - ``COLLECT_ONLY``: analysis still runs (for recon), but the gate
+          always returns ``allowed=True``.
+        - ``GATE_ONLY`` / ``GATE_SELECT``: analysis runs and the result
+          is enforced (fail-closed).
+        """
+        decision = self._evaluate_fix_predecessor_gate_inner()
+        if not decision.allowed and not self.gate_mode.enforces_gate:
+            return FlowGateDecision(
+                True,
+                f"collect-only bypass (underlying: {decision.reason})",
+            )
+        return decision
+
+    def _evaluate_fix_predecessor_gate_inner(self) -> FlowGateDecision:
+        """Core fix-predecessor gate logic (mode-independent)."""
         analysis = self.ensure_dispatcher_analysis()
         if analysis is None:
             return FlowGateDecision(False, "dispatcher analysis unavailable")

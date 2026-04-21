@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import html
 import json
-import logging
+from d810.core.logging import getLogger
 from d810.core import typing
 
 from d810.qt_shim import QtCore, QtWidgets
@@ -16,7 +16,7 @@ from d810.qt_shim import QtCore, QtWidgets
 if typing.TYPE_CHECKING:
     from d810.optimizers.microcode.handler import ConfigParam, OptimizationRule
 
-logger = logging.getLogger("D810.ui.rule_detail")
+logger = getLogger("D810.ui.rule_detail")
 
 
 class RuleDetailPanel(QtWidgets.QWidget):
@@ -308,7 +308,7 @@ class RuleDetailPanel(QtWidgets.QWidget):
             if isinstance(v, int):
                 # It's likely a maturity enum value - convert to string
                 try:
-                    from d810.hexrays.hexrays_formatters import maturity_to_string
+                    from d810.hexrays.utils.hexrays_formatters import maturity_to_string
                     current_values_as_strings.add(maturity_to_string(v))
                 except ImportError:
                     current_values_as_strings.add(str(v))
@@ -472,7 +472,7 @@ class RuleDetailPanel(QtWidgets.QWidget):
         self._emit_change(param_name, selected)
 
     def _emit_change(self, param_name: str, value: typing.Any) -> None:
-        if logger.isEnabledFor(logging.DEBUG):
+        if logger.debug_on:
             logger.debug(
                 "Config param changed: %s = %s", param_name, value
             )
@@ -485,7 +485,7 @@ class RuleDetailPanel(QtWidgets.QWidget):
         if not maturities:
             return ""
         try:
-            from d810.hexrays.hexrays_formatters import maturity_to_string
+            from d810.hexrays.utils.hexrays_formatters import maturity_to_string
 
             return ", ".join(maturity_to_string(m) for m in maturities)
         except ImportError:

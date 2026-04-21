@@ -1,18 +1,12 @@
-from __future__ import annotations
-
 import functools
 import pathlib
+import typing
 
-from d810.core import typing
-from d810.core.typing import TYPE_CHECKING
 import ida_hexrays
 import idaapi
+from ida_hexrays import mbl_array_t, minsn_t, mop_t, vd_printer_t
 
-if TYPE_CHECKING:
-    # Type hints for IDE support when IDA stubs are available
-    from ida_hexrays import mbl_array_t, minsn_t, mop_t
-
-from d810.core import getLogger
+from d810.conf.loggers import getLogger
 from d810.hexrays.hexrays_helpers import (
     MATURITY_TO_STRING_DICT,
     MOP_TYPE_TO_STRING_DICT,
@@ -20,7 +14,7 @@ from d810.hexrays.hexrays_helpers import (
     STRING_TO_MATURITY_DICT,
 )
 
-logger = getLogger(__name__)
+logger = getLogger("D810.helper")
 
 _trans_table = str.maketrans(
     "", "", "".join(chr(i) for i in range(256) if not (0x20 <= i <= 0x7E))
@@ -40,7 +34,7 @@ def _cached_format_minsn_t(ea: int, raw_repr: str) -> str:
     return raw_repr.translate(_trans_table)
 
 
-def format_minsn_t(ins: ida_hexrays.minsn_t | None) -> str:
+def format_minsn_t(ins: minsn_t | None) -> str:
     """Return a printable representation of *ins*.
 
     The heavy-weight ``_print`` call is cached so subsequent requests for the
@@ -53,7 +47,7 @@ def format_minsn_t(ins: ida_hexrays.minsn_t | None) -> str:
     return _cached_format_minsn_t(ins.ea, raw)
 
 
-def mop_tree(mop: ida_hexrays.mop_t | None, depth: int = 0, max_depth: int = 8) -> str:
+def mop_tree(mop: mop_t | None, depth: int = 0, max_depth: int = 8) -> str:
     """
     Recursively format a mop_t tree as a string for inspection.
     Returns a string representation of the tree.
@@ -284,66 +278,7 @@ class MopTreeLogger:
         return renderer.render(mop, indent, child_indent, 0)
 
 
-def count_minsn_nodes(ins: ida_hexrays.minsn_t | None) -> int:
-    """
-    Count the total number of operand nodes in an instruction tree.
-    Used to detect expression bloat from optimization rules.
-
-    Returns the count of all mop_t nodes in the instruction's operand tree.
-    """
-    if ins is None:
-        return 0
-
-    def count_mop_nodes(mop: ida_hexrays.mop_t | None) -> int:
-        if mop is None:
-            return 0
-
-        count = 1  # Count this node
-        mop_type = mop.t if hasattr(mop, "t") else None
-        if mop_type is None:
-            return count
-
-        # Recurse for sub-operands based on mop type
-        if mop_type == ida_hexrays.mop_d and hasattr(mop, "d") and mop.d is not None:
-            # mop_d: instruction, has l, r, d
-            count += count_mop_nodes(getattr(mop.d, "l", None))
-            count += count_mop_nodes(getattr(mop.d, "r", None))
-            count += count_mop_nodes(getattr(mop.d, "d", None))
-        elif mop_type == ida_hexrays.mop_a and hasattr(mop, "a") and mop.a is not None:
-            # mop_a: address, has v
-            count += count_mop_nodes(getattr(mop.a, "v", None))
-        elif mop_type == ida_hexrays.mop_f and hasattr(mop, "f") and mop.f is not None:
-            # mop_f: function call, has args
-            for arg in getattr(mop.f, "args", []):
-                count += count_mop_nodes(arg)
-        elif mop_type == ida_hexrays.mop_c and hasattr(mop, "c") and mop.c is not None:
-            # mop_c: switch cases, has cases (list of mop_t)
-            for case in getattr(mop.c, "cases", []):
-                count += count_mop_nodes(case)
-        elif (
-            mop_type == ida_hexrays.mop_p
-            and hasattr(mop, "pair")
-            and mop.pair is not None
-        ):
-            # mop_p: register pair
-            count += count_mop_nodes(getattr(mop.pair, "lop", None))
-            count += count_mop_nodes(getattr(mop.pair, "hop", None))
-
-        return count
-
-    # Count nodes in all three operands
-    total = 0
-    if hasattr(ins, "l"):
-        total += count_mop_nodes(ins.l)
-    if hasattr(ins, "r"):
-        total += count_mop_nodes(ins.r)
-    if hasattr(ins, "d"):
-        total += count_mop_nodes(ins.d)
-
-    return total
-
-
-def format_mop_t(mop_in: ida_hexrays.mop_t | None) -> str:
+def format_mop_t(mop_in: mop_t | None) -> str:
     if mop_in is None:
         return "mop_t is None"
     if mop_in.t > 15:
@@ -352,7 +287,7 @@ def format_mop_t(mop_in: ida_hexrays.mop_t | None) -> str:
     return mop_tree(mop_in, max_depth=0)
 
 
-def format_mop_list(mop_list: list[ida_hexrays.mop_t]) -> str:
+def format_mop_list(mop_list: list[mop_t]) -> str:
     return ", ".join([format_mop_t(x) for x in mop_list])
 
 
@@ -385,9 +320,9 @@ def opcode_to_string(opcode: int) -> str:
         return "Unknown opcode: {0}".format(opcode)
 
 
-class mba_printer(ida_hexrays.vd_printer_t):
+class mba_printer(vd_printer_t):
     def __init__(self):
-        ida_hexrays.vd_printer_t.__init__(self)
+        vd_printer_t.__init__(self)
         self.mc = []
 
     def get_mc(self):
@@ -398,9 +333,9 @@ class mba_printer(ida_hexrays.vd_printer_t):
         return 1
 
 
-class block_printer(ida_hexrays.vd_printer_t):
+class block_printer(vd_printer_t):
     def __init__(self):
-        ida_hexrays.vd_printer_t.__init__(self)
+        vd_printer_t.__init__(self)
         self.block_ins = []
 
     def get_block_mc(self):
@@ -412,7 +347,7 @@ class block_printer(ida_hexrays.vd_printer_t):
 
 
 def write_mc_to_file(
-    mba: ida_hexrays.mbl_array_t, filename: pathlib.Path, mba_flags: int = 0
+    mba: mbl_array_t, filename: pathlib.Path, mba_flags: int = 0
 ) -> bool:
     if not mba:
         return False
@@ -427,7 +362,7 @@ def write_mc_to_file(
 
 
 def dump_microcode_for_debug(
-    mba: ida_hexrays.mbl_array_t, log_dir_path: pathlib.Path, name: str = ""
+    mba: mbl_array_t, log_dir_path: pathlib.Path, name: str = ""
 ):
     if isinstance(log_dir_path, str):
         log_dir_path = pathlib.Path(log_dir_path)
