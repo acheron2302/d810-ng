@@ -58,3 +58,5 @@ _indexable
 
 # docs
 docs/
+
+*.pyd
