@@ -198,17 +198,18 @@ import ida_hexrays
 
 from d810.core import getLogger
 from d810.hexrays.cfg_utils import (
-    capture_failure_artifact,
     change_1way_block_successor,
     change_2way_block_conditional_successor,
     create_block,
-    create_standalone_block,
     duplicate_block,
     insert_nop_blk,
     log_block_info,
     make_2way_block_goto,
     mba_deep_cleaning,
     safe_verify,
+)
+from d810.hexrays.mutation.cfg_verify import (
+    capture_failure_artifact,
     snapshot_block_for_capture,
 )
 

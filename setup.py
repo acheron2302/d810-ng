@@ -156,7 +156,7 @@ def ensure_ida_sdk(sdk_path: pathlib.Path) -> pathlib.Path:
 def get_compile_args():
     """Return platform-specific compilation arguments."""
     if OSTYPE == "Windows":
-        return ["/TP", "/EHa"] + (["/Z7", "/Od"] if DEBUG else [])
+        return ["/TP", "/EHa", "/Zc:offsetof-", "/std:c++17"] + (["/Z7", "/Od"] if DEBUG else [])
     elif OSTYPE == "Linux":
         base = ["-Wno-stringop-truncation", "-Wno-catch-value", "-Wno-unused-variable"]
         return base + (["-g", "-O0"] if DEBUG else [])
@@ -265,3 +265,80 @@ def get_ext_modules():
 
 # Minimal setup() - everything else comes from pyproject.toml
 setup(ext_modules=get_ext_modules())
+
+
+# -----------------------------------------------------------------------------
+# IDA Plugin Auto-Installation (Windows)
+# -----------------------------------------------------------------------------
+# Post-install hook to copy plugin files to IDA Pro's plugins directory.
+# This ensures the plugin is available to IDA regardless of which Python
+# interpreter IDA uses.
+#
+# To disable auto-install: set D810_INSTALL_IDA_PLUGIN=0 environment variable
+
+if sys.platform == "win32" and "bdist_wheel" not in sys.argv:
+    from setuptools.command.install import install
+    import shutil
+    import pathlib
+
+    _original_install = install.run
+
+    def _ida_plugin_install_run(self):
+        result = _original_install(self)
+        if os.environ.get("D810_INSTALL_IDA_PLUGIN", "1") != "0":
+            _install_to_ida_plugins()
+        return result
+
+    def _install_to_ida_plugins():
+        """Copy plugin files to IDA Pro's Windows plugins directory."""
+        try:
+            appdata = os.environ.get("APPDATA")
+            if not appdata:
+                print("Warning: APPDATA not set, skipping IDA plugin install")
+                return
+
+            ida_plugins_dir = pathlib.Path(appdata) / "Hex-Rays" / "IDA Pro" / "plugins"
+            project_root = pathlib.Path(__file__).parent
+
+            # Files/directories to copy for the plugin
+            items_to_copy = [
+                ("src/d810ng.py", "d810ng.py"),
+                ("src/d810", "d810"),
+                ("ida-plugin.json", "ida-plugin.json"),
+            ]
+            resource_items = [
+                ("resources", "resources"),
+            ]
+
+            # Create plugin directory
+            ida_plugins_dir.mkdir(parents=True, exist_ok=True)
+
+            # Copy main plugin files
+            for src_rel, dst_name in items_to_copy:
+                src = project_root / src_rel
+                dst = ida_plugins_dir / dst_name
+                if src.exists():
+                    if src.is_dir():
+                        if dst.exists():
+                            shutil.rmtree(dst)
+                        shutil.copytree(src, dst)
+                    else:
+                        shutil.copy2(src, dst)
+                    print(f"Copied {src_rel} -> {dst}")
+
+            # Copy resources directory
+            for src_rel, dst_name in resource_items:
+                src = project_root / src_rel
+                dst = ida_plugins_dir.parent / dst_name  # resources alongside plugin folder
+                if src.exists() and not dst.exists():
+                    shutil.copytree(src, dst)
+                    print(f"Copied {src_rel} -> {dst}")
+
+            print(f"\nD810-ng installed to: {ida_plugins_dir}")
+            print("Restart IDA Pro to load the plugin.")
+
+        except Exception as e:
+            print(f"Warning: Failed to install to IDA plugins: {e}")
+            print("Manual installation: copy plugin files to %APPDATA%\\Hex-Rays\\IDA Pro\\plugins")
+
+    install.run = _ida_plugin_install_run
