@@ -175,7 +175,7 @@ Omit `maturities` entirely to inherit the default (`MMAT_LOCOPT`, `MMAT_CALLS`, 
 
 **Only IDA v9 or later is supported with Python 3.10 and higher** (since we need the microcode Python API)
 
-Copy the contents of this repository to `.idapro/plugins` or `%appdata%\Hex-Rays\IDA Pro\plugins`.
+D-810 ng is distributed as a Python package, but the IDA plugin entry point (`d810ng.py`) lives **next to** the `d810/` package and must be visible to IDA's `plugins/` directory. A plain `pip install` registers the Python package; the explicit installer below registers the IDA plugin by creating symlinks so source edits in the repository take effect on the next IDA start.
 
 ### Choose Your Install Path
 
@@ -183,28 +183,40 @@ D-810 ng works without compiled speedups. Every Cython module has a pure Python 
 
 | Path | When to use it | Requires compiler? | Requires IDA SDK? |
 |------|----------------|--------------------|-------------------|
-| Pure Python install (copy plugin files only) | First-time use, no toolchain available | No | No |
+| Pure Python + symlinked source | First-time use, no toolchain available, repo edits take effect on next IDA start | No | No |
 | Package + isolated Z3 (Windows recommended) | You want fast rules without building Cython extensions | No | No |
 | Build speedups from source | You want native speedups and are tracking the repo | Yes (MSVC / clang / gcc) | Yes (or auto-download) |
 | Linux / macOS source build | Same as the row above, on a Unix shell | Yes | Yes (or auto-download) |
 | Docker build | Linux + IDA in a container is available | No (toolchain lives in the image) | Bundled |
 
-### Windows: Recommended Install
+### Recommended Install (any platform)
 
-Use the same Python interpreter IDA uses (or `py` if it is on PATH). Open an elevated **PowerShell** prompt.
+The installer creates symlinks under the IDA `plugins/` directory that point at the live source tree. The package itself is installed with `pip`; the symlinks are what make the plugin discoverable to IDA.
 
-```powershell
-py -m pip install -U pip
-py -m pip install "d810-ng[speedups]"
-py -m d810.speedups.install
+Use the same Python interpreter IDA uses (or `py` if it is on PATH).
+
+```bash
+# 1. Install the Python package (editable mode lets you edit the repo)
+python -m pip install -e ".[speedups]"
+#    or, from a published release:
+python -m pip install "d810-ng[speedups]"
+
+# 2. Register the plugin with IDA by symlinking into IDA's plugins dir
+python -m d810.install_plugin --src-dir src
 ```
 
 What each step does:
 
-* `d810-ng[speedups]` installs the Python package along with the Cython build dependency. Native speedup wheels are used when available for your Python interpreter; otherwise the package installs in pure Python mode and builds nothing.
-* `python -m d810.speedups.install` does **not** compile Cython extensions. It installs `z3-solver>=4.13,<4.15.5` into a private directory so the `libz3.dll` shipped with IDA does not conflict with the one D-810 imports.
+* `d810-ng[speedups]` installs the Python package and pulls in the Cython build dependency. Native speedup wheels are used when available; otherwise the package installs in pure Python mode and builds nothing.
+* `python -m d810.install_plugin --src-dir src` symlinks `d810ng.py` and `d810/` from the repository's `src/` directory into IDA's `plugins/` directory. **The installer intentionally does not place `ida-plugin.json` in the flat plugin layout**; the legacy entry point at `plugins/d810ng.py` is what IDA loads.
 
-If `py` is not available, substitute the full path to the Python interpreter bundled with your IDA install, or `python` if that resolves to the same interpreter.
+If your checkout does not include a `src/` directory (for example a non-editable wheel install), drop `--src-dir` and the installer will derive the source location from the installed `d810` package.
+
+```bash
+python -m d810.install_plugin
+```
+
+The installer refuses to overwrite an existing `plugins/d810ng.py` or `plugins/d810` unless you pass `--force`. A real (non-symlink) directory at `plugins/d810` is **never** deleted automatically because it may contain your user-edited configurations; remove it manually first or pass `--force --force-remove-directory` if you accept the risk.
 
 ### Windows: Enable Isolated Z3 for Speedups
 
@@ -213,6 +225,8 @@ Run this command once after installing or upgrading `d810-ng` (or after updating
 ```powershell
 py -m d810.speedups.install
 ```
+
+`python -m d810.speedups.install` does **not** compile Cython extensions. It installs `z3-solver>=4.13,<4.15.5` into a private directory so the `libz3.dll` shipped with IDA does not conflict with the one D-810 imports.
 
 The command writes the Z3 dependency tree to `%USERPROFILE%\.d810-speedups\` by default. Override the location with the `D810_SPEEDUPS_DIR` environment variable if you need a different path:
 
@@ -223,51 +237,54 @@ py -m d810.speedups.install
 
 On startup, `d810.speedups.bootstrap` prepends that directory to `sys.path` and tells Z3 where to find its native library, preventing the IDA-bundled DLL from being loaded instead.
 
-### Windows: Build Speedups From Source
+### Windows: Symlink Requirements
+
+Symlink creation on Windows requires **either** Developer Mode enabled in **Settings > Privacy & security > For developers**, or an elevated (Run as administrator) shell. Without one of these, `python -m d810.install_plugin` fails with `WinError 1314` and prints the exact `mklink` commands you can run manually.
+
+### Build Speedups From Source
 
 Use this path only if you want native speedup modules built against the headers in your local IDA SDK (or auto-downloaded) and you have a C/C++ toolchain. Speedup build failure is non-fatal: D-810 still loads using the pure Python fallbacks.
 
 **Prerequisites**
 
 * Python matching the architecture/IDA build (e.g. Python 3.10+ for IDA 9).
-* [Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/) with the **Desktop development with C++** workload (provides MSVC, `cl.exe`, and the Windows SDK).
+* [Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/) with the **Desktop development with C++** workload (provides MSVC, `cl.exe`, and the Windows SDK). On Linux/macOS, install `gcc`/`g++` or Apple Clang instead.
 * IDA SDK available locally at a path containing `include/` (or `src/include/`), or willingness to let `setup.py` download the matching SDK into `.ida-sdk/`.
 * Cython installed (`pip install "Cython>=3.0.0"`).
 
 **Local SDK build**
 
-```powershell
-py -m pip install -U pip setuptools wheel "Cython>=3.0.0"
-$env:D810_BUILD_SPEEDUPS = "1"
-$env:IDA_SDK = "C:\IDA\9\sdk"
-py -m pip install -e ".[speedups]" --no-build-isolation
-py -m d810.speedups.install
+```bash
+python -m pip install -U pip setuptools wheel "Cython>=3.0.0"
+D810_BUILD_SPEEDUPS=1 IDA_SDK=/path/to/ida-sdk \
+    python -m pip install --no-build-isolation -e ".[speedups]"
+python -m d810.install_plugin --src-dir src
+python -m d810.speedups.install
 ```
 
 **Auto-downloaded SDK build** (omit `IDA_SDK` so `setup.py` downloads and caches the SDK under `.ida-sdk/`):
 
-```powershell
-$env:D810_BUILD_SPEEDUPS = "1"
-py -m pip install -e ".[speedups]" --no-build-isolation
-py -m d810.speedups.install
+```bash
+D810_BUILD_SPEEDUPS=1 python -m pip install --no-build-isolation -e ".[speedups]"
+python -m d810.install_plugin --src-dir src
+python -m d810.speedups.install
 ```
 
 `--no-build-isolation` tells pip to use the Cython already on `PATH` instead of creating a throwaway build environment, which keeps Cython in sync with the IDA SDK headers on disk.
 
 To compile extensions into the source tree without installing:
 
-```powershell
-$env:D810_BUILD_SPEEDUPS = "1"
-python setup.py build_ext --inplace
+```bash
+D810_BUILD_SPEEDUPS=1 python setup.py build_ext --inplace
 ```
 
-### Windows: Verify Speedups
+### Verify the Install
 
-After installation, restart IDA once. Then confirm:
+After installation, restart IDA once. Then confirm inside IDA:
 
-1. D-810 ng loads normally (no plugin errors in the IDA console).
-2. The IDA console does not report a `libz3.dll` conflict.
-3. Rules of the project configuration you start run without crashing.
+1. The **Ctrl-Shift-D** hotkey opens the D-810 configuration GUI.
+2. The IDA console does **not** show `ModuleNotFoundError: d810`.
+3. The IDA console does **not** show a `libz3.dll` conflict.
 
 If a rule fails or D-810 itself errors, you can confirm the pure Python fallback with:
 
@@ -277,27 +294,31 @@ $env:D810_NO_CYTHON = "1"
 
 Launch IDA with that variable set. If the issue disappears, the problem is in a compiled speedup module; reinstall speedups (or rebuild them) before re-enabling Cython mode.
 
-### Windows: Troubleshooting
+### Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
 | `Microsoft Visual C++ 14.x or greater is required` | MSVC Build Tools missing | Install Visual Studio Build Tools with the C++ workload, then reopen the shell. |
 | Build fails with missing `idaapi.h` / `pro.h` | `IDA_SDK` does not point at an SDK with `include/` | Set `$env:IDA_SDK = "C:\path\to\ida\sdk"` (the folder containing `include`), or unset `IDA_SDK` to allow auto-download. |
 | `OSError: [WinError 193] %1 is not a valid Win32 application` when importing `z3` | Python is loading the `libz3.dll` shipped with IDA instead of the isolated one | Run `py -m d810.speedups.install`; if the conflict persists, set `$env:D810_SPEEDUPS_DIR` to a fresh private directory and rerun. |
+| `OSError: [WinError 1314]` from `python -m d810.install_plugin` | Windows denied the symlink because Developer Mode is off and the shell is not elevated | Enable Developer Mode, or run from an elevated PowerShell. The installer prints the equivalent `mklink` commands so you can create the links by hand. |
 | Cython module raises an unexpected exception when a rule fires | Bug in the compiled extension | Launch IDA with `$env:D810_NO_CYTHON = "1"` to fall back to pure Python, then open an issue. |
 | Build fails for any other reason | Anything else | Reinstall without speedups (`pip install -e .`); D-810 remains fully usable in pure Python mode. |
 
 ### Linux / macOS
 
-Install the package and optionally build speedups from source.
-
-**Pure Python install:**
+Install the package, symlink the plugin, and optionally build speedups from source.
 
 ```bash
+# 1. Install the Python package
 pip install -e .
+# 2. Register the plugin with IDA
+python -m d810.install_plugin --src-dir src
+# 3. Optionally install isolated Z3
+python -m d810.speedups.install
 ```
 
-**Build speedups from source** (SDK auto-downloads from GitHub if `IDA_SDK` is unset):
+To build native speedups, set `D810_BUILD_SPEEDUPS=1` and (optionally) `IDA_SDK`:
 
 ```bash
 D810_BUILD_SPEEDUPS=1 pip install -e ".[speedups]" --no-build-isolation
@@ -311,7 +332,7 @@ IDA_SDK=/path/to/ida-sdk D810_BUILD_SPEEDUPS=1 pip install -e ".[speedups]" --no
 
 `--no-build-isolation` makes pip reuse the Cython already on `PATH` instead of building inside an isolated environment.
 
-**Build extensions in-place only:**
+To compile extensions in place only:
 
 ```bash
 D810_BUILD_SPEEDUPS=1 python setup.py build_ext --inplace
