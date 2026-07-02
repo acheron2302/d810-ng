@@ -29,6 +29,7 @@ ZERO = Const("0", 0)
 ONE = Const("1", 1)
 TWO = Const("2", 2)
 THREE = Const("3", 3)
+MINUS_TWO = Const("-2", -2)
 
 
 # ============================================================================
@@ -513,6 +514,40 @@ class PredFFRule4(VerifiableRule):
     REFERENCE = "Boolean algebra + De Morgan"
 
 
+class PredFFRule5(VerifiableRule):
+    """Simplify: ~(x * (x - 1)) | -2 => 0xFF...FF
+
+    Since x and (x - 1) are consecutive integers, one is even and one is odd,
+    so their product is always even. The bitwise NOT of an even value always
+    has its low bit set, while -2 (= 0x...FE) has every bit set except the
+    low bit. OR-ing them produces all ones.
+    """
+
+    val_ff = DynamicConst("val_ff", lambda ctx: AND_TABLE[ctx.get('size', 4)], size_from="x_0")
+
+    PATTERN = ~(x * (x - ONE)) | MINUS_TWO
+    REPLACEMENT = val_ff
+
+    DESCRIPTION = "Simplify ~(x * (x - 1)) | -2 to 0xFF...FF"
+    REFERENCE = "Parity analysis: consecutive integer product"
+
+
+class PredFFRule6(VerifiableRule):
+    """Simplify: ~(x * (x + 1)) | -2 => 0xFF...FF
+
+    Same reasoning as PredFFRule5, but for the x*(x+1) form (also a product
+    of consecutive integers, hence always even).
+    """
+
+    val_ff = DynamicConst("val_ff", lambda ctx: AND_TABLE[ctx.get('size', 4)], size_from="x_0")
+
+    PATTERN = ~(x * (x + ONE)) | MINUS_TWO
+    REPLACEMENT = val_ff
+
+    DESCRIPTION = "Simplify ~(x * (x + 1)) | -2 to 0xFF...FF"
+    REFERENCE = "Parity analysis: consecutive integer product"
+
+
 # ============================================================================
 # Complex Transformations
 # ============================================================================
@@ -594,19 +629,19 @@ class PredOdd2(VerifiableRule):
 # ============================================================================
 
 """
-Total Predicate rules: 23
+Total Predicate rules: 25
 - PredSetnz: 7 rules (set-if-not-zero)
 - PredSetz: 3 rules (set-if-zero)
 - PredSetb: 1 rule (set-if-below)
 - Pred0: 7 rules (always zero)
-- PredFF: 4 rules (always all-bits-set)
+- PredFF: 6 rules (always all-bits-set)
 - PredOdd: 2 rules (parity/odd-even analysis)
 - Complex: 2 rules (bit manipulation transforms)
 
 All rules verified by Z3 SMT solver.
 
 Constraint patterns used:
-1. DynamicConst for val_0, val_1, val_ff - 17 rules
+1. DynamicConst for val_0, val_1, val_ff - 19 rules
 2. Lambda for constant value checks - 7 rules
    - Bitwise OR/AND checks: 4 rules
    - Parity checks: 1 rule

@@ -231,6 +231,36 @@ class AndBnot_FactorRule_2(VerifiableRule):
     REFERENCE = "Boolean algebra, XOR-AND identity"
 
 
+class AndBnot_ConstantXorMaskRule_1(VerifiableRule):
+    """Simplify: x & (x ^ c_1) => x & c_res, where c_res == ~c_1
+
+    Constant-specialized form of AndBnot_FactorRule_2. Because constants
+    are represented symbolically in the DSL, the XOR mask is materialized
+    into a concrete AND mask at runtime via a defining constraint on
+    c_res. At the default 32-bit rule width this reduces, for example,
+    ``v & (v ^ 0xFFFFFFFE)`` to ``v & 1``.
+
+    Proof:
+        x ^ c = (x & ~c) | (~x & c)
+        x & (x ^ c) = (x & ~c) | 0 = x & ~c
+
+    Example (32-bit):
+        a & (a ^ 0xFFFFFFFE) => a & 1   (since ~0xFFFFFFFE == 1)
+    """
+    maturities = _ALL_MATURITIES
+
+    c_1 = Const("c_1")
+    c_res = Const("c_res")  # ~c_1, materialized at runtime
+
+    PATTERN = x & (x ^ c_1)
+    REPLACEMENT = x & c_res
+
+    CONSTRAINTS = [c_res == ~c_1]
+
+    DESCRIPTION = "Simplify x & (x ^ c) to x & ~c (constant XOR mask)"
+    REFERENCE = "Boolean algebra, constant XOR-AND identity"
+
+
 class AndBnot_FactorRule_3(VerifiableRule):
     """Simplify: (x | y) ^ y => x & ~y
 
