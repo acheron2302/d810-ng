@@ -6,12 +6,12 @@ import ida_hexrays
 from d810.conf.loggers import getLogger
 from d810.errors import D810Z3Exception
 from d810.expr.ast import AstLeaf, AstNode, minsn_to_ast, mop_to_ast
-from d810.hexrays.hexrays_formatters import (
+from d810.hexrays.utils.hexrays_formatters import (
     format_minsn_t,
     format_mop_t,
     opcode_to_string,
 )
-from d810.hexrays.hexrays_helpers import get_mop_index
+from d810.hexrays.utils.hexrays_helpers import get_mop_index
 
 logger = getLogger(__name__)
 z3_file_logger = getLogger("D810.z3_test")

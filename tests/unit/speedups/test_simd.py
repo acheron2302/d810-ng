@@ -78,11 +78,27 @@ class TestMemEq:
         with pytest.raises(ValueError, match="32 bytes"):
             cy_mem_eq_32(b"\x00" * 31, b"\x00" * 32)
 
-    def test_mem_eq_16_longer_buffers(self):
-        """Only first 16 bytes matter."""
+    def test_mem_eq_16_rejects_longer_buffers(self):
+        """Longer buffers must be rejected (no silent prefix comparison)."""
         a = b"\x42" * 16 + b"\xFF" * 16
         b = b"\x42" * 16 + b"\x00" * 16
-        assert cy_mem_eq_16(a, b) is True
+        with pytest.raises(ValueError, match="16 bytes"):
+            cy_mem_eq_16(a, b)
+
+    def test_mem_eq_16_rejects_17_bytes(self):
+        with pytest.raises(ValueError, match="16 bytes"):
+            cy_mem_eq_16(b"\x42" * 17, b"\x42" * 17)
+
+    def test_mem_eq_32_rejects_longer_buffers(self):
+        """Longer buffers must be rejected (no silent prefix comparison)."""
+        a = b"\xAB" * 32 + b"\xFF" * 32
+        b = b"\xAB" * 32 + b"\x00" * 32
+        with pytest.raises(ValueError, match="32 bytes"):
+            cy_mem_eq_32(a, b)
+
+    def test_mem_eq_32_rejects_33_bytes(self):
+        with pytest.raises(ValueError, match="32 bytes"):
+            cy_mem_eq_32(b"\xAB" * 33, b"\xAB" * 33)
 
 
 class TestHashU64:

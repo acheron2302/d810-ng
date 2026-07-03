@@ -6,17 +6,17 @@ from ida_hexrays import *
 
 from d810.conf.loggers import getLogger
 from d810.expr.emulator import MicroCodeEnvironment, MicroCodeInterpreter
-from d810.hexrays.cfg_utils import (
+from d810.hexrays.mutation.cfg_mutations import (
     change_1way_block_successor,
     change_2way_block_conditional_successor,
     duplicate_block,
 )
-from d810.hexrays.hexrays_formatters import (
+from d810.hexrays.utils.hexrays_formatters import (
     format_minsn_t,
     format_mop_t,
     mop_type_to_string,
 )
-from d810.hexrays.hexrays_helpers import (
+from d810.hexrays.utils.hexrays_helpers import (
     append_mop_if_not_in_list,
     equal_mops_ignore_size,
     get_blk_index,

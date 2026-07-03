@@ -1,5 +1,17 @@
 """Guard test: ensures MopSnapshot class body is complete (catches indentation regressions)."""
-from d810.hexrays.mop_snapshot import MopSnapshot
+import pytest
+
+try:
+    from d810.hexrays.mop_snapshot import MopSnapshot
+    HAS_MOP_SNAPSHOT = True
+except ImportError:
+    HAS_MOP_SNAPSHOT = False
+
+
+pytestmark = pytest.mark.skipif(
+    not HAS_MOP_SNAPSHOT,
+    reason="ida_hexrays not available",
+)
 
 
 def test_mop_snapshot_has_all_fields():
@@ -53,3 +65,30 @@ def test_mop_snapshot_has_from_mop():
 def test_mop_snapshot_has_to_cache_key():
     """MopSnapshot.to_cache_key must be a method."""
     assert hasattr(MopSnapshot, "to_cache_key"), "MopSnapshot.to_cache_key is missing"
+
+
+def test_to_cache_key_includes_pair_fields():
+    """Regression: ``to_cache_key`` must include ``pair_lo_t`` and
+    ``pair_hi_t`` so that two snapshots that compare unequal via
+    :meth:`__eq__` also produce distinct cache keys.
+
+    The Cython backend previously omitted these two fields, leading to
+    silent cache aliasing where two distinct mop_pair operands would
+    hash and cache-key as equal.
+    """
+    snap_a = MopSnapshot(t=14, size=0, pair_lo_t=2, pair_hi_t=0)
+    snap_b = MopSnapshot(t=14, size=0, pair_lo_t=2, pair_hi_t=3)
+
+    # If both backends are installed we exercise the Cython one; otherwise
+    # the pure-Python dataclass still satisfies the contract.
+    key_a = snap_a.to_cache_key()
+    key_b = snap_b.to_cache_key()
+    assert key_a != key_b, (
+        "MopSnapshot.to_cache_key() does not include pair_lo_t/pair_hi_t: "
+        f"two snapshots that differ only in pair fields cache-collide "
+        f"(key={key_a!r})"
+    )
+
+    # Sanity: snapshots that are actually equal still cache to the same key.
+    snap_c = MopSnapshot(t=14, size=0, pair_lo_t=2, pair_hi_t=0)
+    assert snap_a.to_cache_key() == snap_c.to_cache_key()

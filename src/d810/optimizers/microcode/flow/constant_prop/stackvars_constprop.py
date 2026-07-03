@@ -15,18 +15,18 @@ import ida_hexrays
 
 from d810 import _compat
 from d810.conf.loggers import getLogger
-from d810.hexrays.cfg_utils import (
+from d810.hexrays.ir.mop_utils import (
     extract_base_and_offset,
     get_stack_var_name,
-    safe_verify,
 )
-from d810.hexrays.hexrays_formatters import (
+from d810.hexrays.mutation.cfg_verify import safe_verify
+from d810.hexrays.utils.hexrays_formatters import (
     format_minsn_t,
     format_mop_t,
     opcode_to_string,
     sanitize_ea,
 )
-from d810.hexrays.hexrays_helpers import AND_TABLE
+from d810.hexrays.utils.hexrays_helpers import AND_TABLE
 from d810.optimizers.microcode.flow.handler import FlowOptimizationRule
 
 logger = getLogger(__name__)

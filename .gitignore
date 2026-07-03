@@ -60,3 +60,5 @@ _indexable
 docs/
 
 *.pyd
+
+.kilo/

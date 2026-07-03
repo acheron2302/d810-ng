@@ -82,7 +82,7 @@ def test_maturity_gate_allows_optimizer_at_correct_maturity():
     assert rule.calls == 1, f"Rule was not called at correct maturity"
 
 
-from d810.hexrays.hexrays_hooks import InstructionOptimizerManager
+from d810.hexrays.hooks.hexrays_hooks import InstructionOptimizerManager
 
 
 class _MockOptimizer:
@@ -133,7 +133,7 @@ def test_active_optimizer_list_filters_by_maturity():
     ins = _make_ins()
     mgr.log_info_on_input(blk, ins)
 
-    # Now call optimize — only locopt_opt should be called
+    # Now call optimize â€” only locopt_opt should be called
     mgr.optimize(blk, ins)
 
     assert early_opt.calls == 0, f"EarlyOpt was called {early_opt.calls} times at LOCOPT"

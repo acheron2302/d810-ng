@@ -1,5 +1,5 @@
 from d810.expr.ast import AstConstant, AstLeaf, AstNode
-from d810.hexrays.hexrays_helpers import equal_bnot_mop
+from d810.hexrays.utils.hexrays_helpers import equal_bnot_mop
 from d810.optimizers.microcode.instructions.pattern_matching.handler import (
     PatternMatchingRule,
 )

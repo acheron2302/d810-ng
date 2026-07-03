@@ -259,14 +259,16 @@ class D810Configuration:
         Precedence order:
         1. *Writable* user directory  <IDA_USER>/cfg/d810/<cfg_name>
         2. Built-in read-only templates shipped with the plugin
-            (located next to this file in d810/conf/).
+            (located in the same directory as this file, ``d810/conf/``).
         """
         user_path = self.config_dir / cfg_name
         if user_path.exists():
             return user_path
 
-        # Fallback to read-only template bundled with the plugin
-        return pathlib.Path(__file__).resolve().parent / "conf" / cfg_name
+        # Fallback to read-only template bundled with the plugin.
+        # ``__file__`` is .../d810/conf/__init__.py, so ``parent`` is the
+        # ``d810/conf`` directory that holds the bundled JSON templates.
+        return pathlib.Path(__file__).resolve().parent / cfg_name
 
     @property
     def config_dir(self) -> pathlib.Path:

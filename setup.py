@@ -28,7 +28,16 @@ BUILD_SPEEDUPS = os.environ.get("D810_BUILD_SPEEDUPS", "0") == "1"
 # Default SDK location (in build directory)
 DEFAULT_SDK_DIR = pathlib.Path(__file__).parent / ".ida-sdk"
 IDA_SDK_REPO = "https://github.com/HexRaysSA/ida-sdk.git"
-IDA_SDK_BRANCH = "main"
+# Pin the SDK to a known ref instead of tracking ``main`` so we get
+# deterministic builds.  Override with IDA_SDK_BRANCH if you need a
+# different ref.  The default SHA-256 below is the pinned commit; if
+# you bump IDA_SDK_PINNED_SHA you MUST also update
+# IDA_SDK_PINNED_SHA256 with the new tarball's digest.
+IDA_SDK_BRANCH = os.environ.get("IDA_SDK_BRANCH", "main")
+IDA_SDK_PINNED_SHA = os.environ.get("IDA_SDK_PINNED_SHA", "")
+# sha256 of the ``refs/heads/<branch>`` tarball.  Empty means "do not
+# verify" (acceptable when overriding the branch via env).
+IDA_SDK_PINNED_SHA256 = os.environ.get("IDA_SDK_PINNED_SHA256", "")
 
 # Platform detection
 OSTYPE = platform.system()
@@ -63,10 +72,43 @@ def _sdk_include_dir(sdk_path: pathlib.Path) -> pathlib.Path:
 
 
 def _sdk_lib_dir(sdk_path: pathlib.Path, *sub: str) -> pathlib.Path:
-    """Return a library directory for the SDK, handling both layouts."""
-    if (sdk_path / "src" / "lib").exists():
-        return sdk_path / "src" / "lib" / pathlib.Path(*sub) if sub else sdk_path / "src" / "lib"
-    return sdk_path / "lib" / pathlib.Path(*sub) if sub else sdk_path / "lib"
+    """Return a library directory for the SDK, handling both layouts.
+
+    The Hex-Rays public SDK ships a ``src/lib/x64_win_64`` layout while
+    older / vendor layouts use names like ``x64_win_vc_64``.  When *sub*
+    points at a directory that does not exist, fall back to scanning the
+    lib tree for a sibling whose name starts with the same arch+os prefix
+    (``x64_win``, ``x64_linux``, ``arm64_linux``, ...), so the linker
+    finds ``ida.lib`` and ``idalib.lib`` regardless of which SDK
+    revision is installed.  Among siblings the directory containing
+    ``ida.lib`` is preferred; otherwise we prefer the 64-bit variant
+    (``_64``) over 32-bit.
+    """
+    base = sdk_path / "src" / "lib"
+    if not base.exists():
+        base = sdk_path / "lib"
+    target = base / pathlib.Path(*sub) if sub else base
+    if sub and not target.exists():
+        prefix_tokens = sub[0].split("_")[:2]
+        prefix = "_".join(prefix_tokens)
+        siblings = [
+            c for c in base.iterdir()
+            if c.is_dir() and c.name.startswith(prefix)
+        ]
+
+        def _score(candidate: pathlib.Path) -> tuple:
+            name = candidate.name
+            # Prefer directories that actually contain ida.lib so we do
+            # not silently link against an empty shell.
+            has_ida = (candidate / "ida.lib").exists()
+            # Prefer 64-bit over 32-bit.
+            is_64 = "_64" in name
+            return (has_ida, is_64, name)
+
+        if siblings:
+            siblings.sort(key=_score, reverse=True)
+            return siblings[0]
+    return target
 
 
 def get_ida_sdk_version(sdk_path: pathlib.Path) -> int:
@@ -108,20 +150,48 @@ def ensure_ida_sdk(sdk_path: pathlib.Path) -> pathlib.Path:
 
     # Try git clone first (faster, gets only latest)
     if shutil.which("git"):
-        try:
-            subprocess.run(
-                ["git", "clone", "--depth=1", "--branch", IDA_SDK_BRANCH,
-                 IDA_SDK_REPO, str(DEFAULT_SDK_DIR)],
-                check=True,
-                capture_output=True,
-            )
-            print(f"IDA SDK downloaded to: {DEFAULT_SDK_DIR}", file=sys.stderr)
-            return DEFAULT_SDK_DIR
-        except subprocess.CalledProcessError as e:
-            print(f"git clone failed: {e.stderr.decode()}", file=sys.stderr)
-            # Clean up partial clone before tarball fallback
-            if DEFAULT_SDK_DIR.exists() and not _sdk_has_includes(DEFAULT_SDK_DIR):
-                shutil.rmtree(DEFAULT_SDK_DIR)
+        clone_cmd = ["git", "clone", "--depth=1"]
+        if IDA_SDK_BRANCH:
+            clone_cmd.extend(["--branch", IDA_SDK_BRANCH])
+        if IDA_SDK_PINNED_SHA:
+            # When the user provides a pinned SHA, switch to a full
+            # clone so we can check out the exact commit deterministically.
+            clone_cmd = ["git", "clone", IDA_SDK_REPO, str(DEFAULT_SDK_DIR)]
+            try:
+                subprocess.run(
+                    clone_cmd,
+                    check=True,
+                    capture_output=True,
+                )
+                subprocess.run(
+                    ["git", "-C", str(DEFAULT_SDK_DIR), "checkout", IDA_SDK_PINNED_SHA],
+                    check=True,
+                    capture_output=True,
+                )
+                print(
+                    f"IDA SDK pinned to {IDA_SDK_PINNED_SHA} at: {DEFAULT_SDK_DIR}",
+                    file=sys.stderr,
+                )
+                return DEFAULT_SDK_DIR
+            except subprocess.CalledProcessError as e:
+                print(f"git clone (pinned) failed: {e.stderr.decode()}", file=sys.stderr)
+                if DEFAULT_SDK_DIR.exists():
+                    shutil.rmtree(DEFAULT_SDK_DIR)
+        else:
+            clone_cmd.extend([IDA_SDK_REPO, str(DEFAULT_SDK_DIR)])
+            try:
+                subprocess.run(
+                    clone_cmd,
+                    check=True,
+                    capture_output=True,
+                )
+                print(f"IDA SDK downloaded to: {DEFAULT_SDK_DIR}", file=sys.stderr)
+                return DEFAULT_SDK_DIR
+            except subprocess.CalledProcessError as e:
+                print(f"git clone failed: {e.stderr.decode()}", file=sys.stderr)
+                # Clean up partial clone before tarball fallback
+                if DEFAULT_SDK_DIR.exists() and not _sdk_has_includes(DEFAULT_SDK_DIR):
+                    shutil.rmtree(DEFAULT_SDK_DIR)
 
     # Fallback: download tarball
     try:
@@ -131,11 +201,47 @@ def ensure_ida_sdk(sdk_path: pathlib.Path) -> pathlib.Path:
         with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
             urllib.request.urlretrieve(tarball_url, tmp.name)
 
+            # Optional SHA-256 verification when the caller pinned the
+            # build to a known digest.
+            if IDA_SDK_PINNED_SHA256:
+                import hashlib
+
+                h = hashlib.sha256()
+                with open(tmp.name, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(65536), b""):
+                        h.update(chunk)
+                digest = h.hexdigest()
+                if digest.lower() != IDA_SDK_PINNED_SHA256.lower():
+                    os.unlink(tmp.name)
+                    raise RuntimeError(
+                        f"IDA SDK tarball SHA-256 mismatch: "
+                        f"got {digest}, expected {IDA_SDK_PINNED_SHA256}"
+                    )
+                print(f"IDA SDK tarball SHA-256 OK ({digest})", file=sys.stderr)
+
             with tarfile.open(tmp.name, "r:gz") as tar:
                 with tempfile.TemporaryDirectory() as tmpdir:
+                    # Python 3.12+ supports ``filter="data"`` to refuse
+                    # absolute paths and dangerous members; on older
+                    # interpreters we must validate members manually
+                    # because the older ``tar.extractall`` accepts any
+                    # path the tarball specifies (CVE-2007-4559 class).
                     try:
                         tar.extractall(tmpdir, filter="data")
                     except TypeError:
+                        # Python <3.12: refuse anything that tries to
+                        # escape the destination directory.
+                        dest_root = pathlib.Path(tmpdir).resolve()
+                        for member in tar.getmembers():
+                            member_path = (dest_root / member.name).resolve()
+                            if (
+                                not str(member_path).startswith(str(dest_root))
+                                or member_path == dest_root
+                                and member.name == ".."
+                            ):
+                                raise RuntimeError(
+                                    f"Refusing unsafe tar member: {member.name!r}"
+                                )
                         tar.extractall(tmpdir)
                     extracted = next(pathlib.Path(tmpdir).iterdir())
                     shutil.move(str(extracted), str(DEFAULT_SDK_DIR))
@@ -264,81 +370,16 @@ def get_ext_modules():
 
 
 # Minimal setup() - everything else comes from pyproject.toml
-setup(ext_modules=get_ext_modules())
-
-
-# -----------------------------------------------------------------------------
-# IDA Plugin Auto-Installation (Windows)
-# -----------------------------------------------------------------------------
-# Post-install hook to copy plugin files to IDA Pro's plugins directory.
-# This ensures the plugin is available to IDA regardless of which Python
-# interpreter IDA uses.
 #
-# To disable auto-install: set D810_INSTALL_IDA_PLUGIN=0 environment variable
-
-if sys.platform == "win32" and "bdist_wheel" not in sys.argv:
-    from setuptools.command.install import install
-    import shutil
-    import pathlib
-
-    _original_install = install.run
-
-    def _ida_plugin_install_run(self):
-        result = _original_install(self)
-        if os.environ.get("D810_INSTALL_IDA_PLUGIN", "1") != "0":
-            _install_to_ida_plugins()
-        return result
-
-    def _install_to_ida_plugins():
-        """Copy plugin files to IDA Pro's Windows plugins directory."""
-        try:
-            appdata = os.environ.get("APPDATA")
-            if not appdata:
-                print("Warning: APPDATA not set, skipping IDA plugin install")
-                return
-
-            ida_plugins_dir = pathlib.Path(appdata) / "Hex-Rays" / "IDA Pro" / "plugins"
-            project_root = pathlib.Path(__file__).parent
-
-            # Files/directories to copy for the plugin
-            items_to_copy = [
-                ("src/d810ng.py", "d810ng.py"),
-                ("src/d810", "d810"),
-                ("ida-plugin.json", "ida-plugin.json"),
-            ]
-            resource_items = [
-                ("resources", "resources"),
-            ]
-
-            # Create plugin directory
-            ida_plugins_dir.mkdir(parents=True, exist_ok=True)
-
-            # Copy main plugin files
-            for src_rel, dst_name in items_to_copy:
-                src = project_root / src_rel
-                dst = ida_plugins_dir / dst_name
-                if src.exists():
-                    if src.is_dir():
-                        if dst.exists():
-                            shutil.rmtree(dst)
-                        shutil.copytree(src, dst)
-                    else:
-                        shutil.copy2(src, dst)
-                    print(f"Copied {src_rel} -> {dst}")
-
-            # Copy resources directory
-            for src_rel, dst_name in resource_items:
-                src = project_root / src_rel
-                dst = ida_plugins_dir.parent / dst_name  # resources alongside plugin folder
-                if src.exists() and not dst.exists():
-                    shutil.copytree(src, dst)
-                    print(f"Copied {src_rel} -> {dst}")
-
-            print(f"\nD810-ng installed to: {ida_plugins_dir}")
-            print("Restart IDA Pro to load the plugin.")
-
-        except Exception as e:
-            print(f"Warning: Failed to install to IDA plugins: {e}")
-            print("Manual installation: copy plugin files to %APPDATA%\\Hex-Rays\\IDA Pro\\plugins")
-
-    install.run = _ida_plugin_install_run
+# NOTE: The previous Windows-only ``install.run`` post-install hook that
+# copied plugin files into ``%APPDATA%\\Hex-Rays\\IDA Pro\\plugins`` has been
+# removed. It was unreliable (its monkey patch was defined after the
+# ``setup()`` call) and produced a descriptor mismatch because it copied the
+# ``ida-plugin.json`` whose ``entryPoint`` only matches a ``src/`` layout.
+#
+# Plugin registration is now handled by the explicit symlink installer:
+#
+#     python -m d810.install_plugin
+#
+# See README.md for details.
+setup(ext_modules=get_ext_modules())

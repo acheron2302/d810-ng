@@ -1,32 +1,15 @@
-"""E-graph backend for MBA optimization (placeholder).
+"""Compatibility shim for ``d810.backends.mba.egraph``.
 
-This module will provide e-graph-based optimization for MBA expressions.
-See docs/EGRAPH_DESIGN.md for the full design.
+The canonical (placeholder) implementation lives in
+:mod:`d810.backends.mba.egraph`. This module re-exports its (currently
+empty) public surface so external scripts, tests, and persisted plugin
+code that import the legacy path keep working.
 
-Future functionality:
-- MBARuleset: Collection of verified MBA rules for e-graph optimization
-- EGraphSimplifier: Simplify expressions using e-graph saturation
-- EGraphBackend: Protocol for different e-graph implementations (egg-python, etc.)
-
-Example usage (after implementation):
-    >>> from d810.mba import Var, MBARule
-    >>> from d810.mba.backends.egraph import MBARuleset, EGraphSimplifier
-    >>>
-    >>> # Create ruleset from verified MBA rules
-    >>> ruleset = MBARuleset([XorRule1(), XorRule2()])
-    >>> ruleset.verify_all()  # Z3 verifies all rules
-    >>>
-    >>> # Create simplifier
-    >>> simplifier = EGraphSimplifier(ruleset, backend=EggBackend())
-    >>>
-    >>> # Simplify complex MBA expression
-    >>> x, y, z = Var("x"), Var("y"), Var("z")
-    >>> complex = ((x + y) - 2*(x & y) | z) - ((x + y) - 2*(x & y) & z)
-    >>> simple = simplifier.simplify(complex)
-    >>> print(simple)  # x ^ y ^ z
+Do not add new logic here. New code must import from
+``d810.backends.mba.egraph`` directly.
 """
+from __future__ import annotations
 
-# Placeholder - to be implemented as part of e-graph integration
-__all__ = []
+from d810.backends.mba.egraph import *  # noqa: F401,F403  (placeholder has empty __all__)
 
-# See docs/EGRAPH_DESIGN.md for implementation details
+__all__ = []  # placeholder module currently has no public symbols

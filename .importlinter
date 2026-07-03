@@ -14,6 +14,14 @@ forbidden_modules =
     d810.hexrays
 ignore_imports =
     tests.unit.test_mop_snapshot_guard -> d810.hexrays.mop_snapshot
+    # Tests that only exercise egglog availability (skip when IDA absent) but
+    # transitively import the canonical egglog backend which pulls in
+    # d810.hexrays.expr.ast. They run under --forked in CI only when egglog
+    # is installed; the import-time IDA dependency is exercised in
+    # tests/system/runtime.
+    tests.unit.test_rule_analysis -> d810.backends.mba.egglog_backend
+    tests.unit.test_egglog_pattern_gen -> d810.backends.mba.egglog_backend
+    tests.unit.test_ida_pattern_generation -> d810.backends.mba.egglog_backend
 
 [importlinter:contract:unit-tests-no-ui]
 name = Unit tests must not import ui modules
@@ -48,3 +56,97 @@ forbidden_modules =
     idc
     idautils
     idapro
+
+# ---------------------------------------------------------------------------
+# Architecture consolidation contracts (canonical-only internal imports)
+# ---------------------------------------------------------------------------
+# These contracts prevent new internal imports of legacy duplicate modules
+# while still allowing:
+#   - The legacy modules themselves (they ARE the shims).
+#   - Compatibility tests that explicitly exercise the shim surface.
+# Update the `ignore_imports` section when adding a new compatibility test.
+# ---------------------------------------------------------------------------
+
+[importlinter:contract:no-legacy-hexrays-utils]
+name = Production source must import the canonical hexrays.utils package
+type = forbidden
+source_modules =
+    d810.optimizers
+    d810.evaluator
+    d810.expr
+    d810.backends
+    d810.recon
+    d810.speedups
+    d810.cfg
+    d810.manager
+forbidden_modules =
+    d810.hexrays.arch_utils
+    d810.hexrays.hexrays_formatters
+    d810.hexrays.hexrays_helpers
+    d810.hexrays.ida_utils
+    d810.hexrays.table_utils
+
+[importlinter:contract:no-legacy-hexrays-hooks]
+name = Production source must import the canonical hexrays.hooks package
+type = forbidden
+source_modules =
+    d810.optimizers
+    d810.evaluator
+    d810.expr
+    d810.backends
+    d810.recon
+    d810.speedups
+    d810.cfg
+    d810.manager
+forbidden_modules =
+    d810.hexrays.hexrays_hooks
+    d810.hexrays.ctree_hooks
+
+[importlinter:contract:no-legacy-hexrays-ir]
+name = Production source must import the canonical hexrays.ir package
+type = forbidden
+source_modules =
+    d810.optimizers
+    d810.evaluator
+    d810.expr
+    d810.backends
+    d810.recon
+    d810.speedups
+    d810.cfg
+    d810.manager
+forbidden_modules =
+    d810.hexrays.mop_snapshot
+    d810.hexrays.block_helpers
+
+[importlinter:contract:no-legacy-hexrays-mutation]
+name = Production source must import the canonical hexrays.mutation package
+type = forbidden
+source_modules =
+    d810.optimizers
+    d810.evaluator
+    d810.expr
+    d810.backends
+    d810.recon
+    d810.speedups
+    d810.cfg
+    d810.manager
+forbidden_modules =
+    d810.hexrays.deferred_modifier
+    d810.hexrays.cfg_utils
+
+[importlinter:contract:no-legacy-mba-backends]
+name = Production source must import the canonical backends.mba package
+type = forbidden
+source_modules =
+    d810.optimizers
+    d810.evaluator
+    d810.expr
+    d810.recon
+    d810.speedups
+    d810.cfg
+    d810.manager
+forbidden_modules =
+    d810.mba.backends.ida
+    d810.mba.backends.z3
+    d810.mba.backends.egraph
+    d810.mba.backends.egglog_backend

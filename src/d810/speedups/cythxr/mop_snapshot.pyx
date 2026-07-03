@@ -267,6 +267,13 @@ cdef class MopSnapshot:
         Equivalent to the tuple produced by the existing
         get_mop_key() function in p_ast.py.
 
+        The returned tuple MUST include every field that participates in
+        :meth:`__eq__`, otherwise two snapshots that compare unequal via
+        ``==`` would still hash equal and collide in cache dictionaries.
+        In particular this includes ``pair_lo_t`` and ``pair_hi_t`` for
+        mop_t pair operands (mop_p); the previous implementation omitted
+        them, leading to silent cache aliasing.
+
         Returns:
             Tuple of all field values
         """
@@ -275,6 +282,7 @@ cdef class MopSnapshot:
             self.value, self.reg, self.stkoff, self.gaddr,
             self.lvar_idx, self.lvar_off, self.block_num,
             self.helper_name, self.const_str,
+            self.pair_lo_t, self.pair_hi_t,
         )
 
     def to_mop(self):

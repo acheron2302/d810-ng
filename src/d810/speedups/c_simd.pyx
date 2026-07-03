@@ -42,9 +42,12 @@ def tzcnt32(unsigned int x) -> int:
 def cy_mem_eq_16(bytes a, bytes b) -> bool:
     """Compare 16 bytes for equality using SIMD (SSE2/NEON/scalar).
 
-    Both arguments must be exactly 16 bytes.
+    Both arguments must be exactly 16 bytes.  Buffers of any other length
+    are rejected with :class:`ValueError` because the underlying
+    comparison reads exactly 16 bytes and silently truncating longer
+    buffers would mask buffer-size mismatches at the call site.
     """
-    if len(a) < 16 or len(b) < 16:
+    if len(a) != 16 or len(b) != 16:
         raise ValueError(f"mem_eq_16 requires 16 bytes each, got {len(a)} and {len(b)}")
     return c_mem_eq_16(<const char *>a, <const char *>b)
 
@@ -52,9 +55,10 @@ def cy_mem_eq_16(bytes a, bytes b) -> bool:
 def cy_mem_eq_32(bytes a, bytes b) -> bool:
     """Compare 32 bytes for equality using SIMD (AVX2/2xSSE2/scalar).
 
-    Both arguments must be exactly 32 bytes.
+    Both arguments must be exactly 32 bytes.  Buffers of any other length
+    are rejected with :class:`ValueError`.
     """
-    if len(a) < 32 or len(b) < 32:
+    if len(a) != 32 or len(b) != 32:
         raise ValueError(f"mem_eq_32 requires 32 bytes each, got {len(a)} and {len(b)}")
     return c_mem_eq_32(<const char *>a, <const char *>b)
 

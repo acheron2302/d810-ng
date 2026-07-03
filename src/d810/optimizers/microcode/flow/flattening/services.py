@@ -184,7 +184,7 @@ class PathEmulator:
             MicroCodeEnvironment,
             MicroCodeInterpreter,
         )
-        from d810.hexrays.helper import format_minsn_t, format_mop_t
+        from d810.hexrays.utils.hexrays_formatters import format_minsn_t, format_mop_t
         from d810.evaluator.hexrays_microcode.tracker import MopHistory, MopTracker
 
         context.logger.debug(

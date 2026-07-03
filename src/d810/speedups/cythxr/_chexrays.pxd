@@ -18,7 +18,7 @@ from libcpp.pair cimport pair
 from libcpp.map cimport map
 from libcpp.unordered_map cimport unordered_map
 from libcpp.memory cimport shared_ptr
-from cpython cimport PyObject, PyObject_GetAttrString
+from cpython cimport PyObject
 from cython.operator cimport dereference as deref
 
 # =============================================================================
@@ -361,7 +361,7 @@ cdef extern from "hexrays.hpp":
         mop_t d
         const char *dstr() const
         void optimize_solo(int optflags)
-        bint has_side_effects(bint include_ldx_stx) const
+        bint has_side_effects(bint include_ldx_stx=0) const
         bint is_unknown_call() const
 
     cdef cppclass mblock_t:
@@ -417,9 +417,27 @@ cdef extern from "swigpyobject.h":
 
 ctypedef SwigPyObject* SwigPyObjectPtr
 
-cdef inline void* _swig_ptr(object obj):
-    addr = PyObject_GetAttrString(obj, "this")
-    return (<SwigPyObjectPtr>addr).ptr
+cdef inline void* _swig_ptr(object obj) except NULL:
+    """Return the raw C++ pointer stored in a SWIG proxy's ``this`` attribute.
+
+    Raises ``TypeError`` (instead of crashing) if *obj* is not a SWIG proxy
+    or if its underlying pointer is NULL.  ``py_this`` is held as a Python
+    object so Cython decrefs the new reference automatically when it goes
+    out of scope.
+
+    We use ``getattr`` with a default of ``None`` instead of calling
+    ``PyObject_GetAttrString`` directly because the latter raises a
+    Python ``AttributeError`` for missing attributes; we want a
+    ``TypeError`` so callers can distinguish "expected a SWIG proxy"
+    from a generic attribute miss.
+    """
+    cdef object py_this = getattr(obj, "this", None)
+    if py_this is None:
+        raise TypeError("expected a SWIG proxy with a 'this' attribute")
+    cdef void* ptr = (<SwigPyObjectPtr><PyObject*>py_this).ptr
+    if ptr == NULL:
+        raise TypeError("SWIG proxy has a NULL C++ pointer")
+    return ptr
 
 
 # =============================================================================

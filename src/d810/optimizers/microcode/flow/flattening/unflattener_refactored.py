@@ -157,12 +157,24 @@ class UnflattenerRule:
 
         for pred_serial in predecessor_serials:
             pred_block = context.mba.get_mblock(pred_serial)
+            # Skip predecessor slots that no longer resolve to a valid block.
+            # CFG mutations may invalidate references between the dispatch
+            # collection step and the per-predecessor patch step.
+            if pred_block is None:
+                logger.debug(
+                    "Skipping predecessor serial %s -- block no longer resolves",
+                    pred_serial,
+                )
+                continue
 
             try:
-                # Ensure the predecessor is in a form we can work with
+                # Ensure the predecessor is in a form we can work with.
+                # The CFG patcher signature requires both the predecessor
+                # (father) and the dispatcher (child) to be supplied.
                 changes += self._patcher.ensure_unconditional_predecessor(
                     context,
-                    dispatcher.entry_block
+                    pred_block,
+                    dispatcher.entry_block,
                 )
 
                 # Emulate to find where this predecessor actually goes

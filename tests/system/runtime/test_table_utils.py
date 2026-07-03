@@ -1,4 +1,4 @@
-"""System tests for d810.hexrays.table_utils.
+"""System tests for d810.hexrays.utils.table_utils.
 
 These tests exercise table_utils functions with real IDA Pro modules loaded.
 No mocks, no stubs, no _ensure_ida_stubs().
@@ -20,7 +20,7 @@ import platform
 
 import pytest
 
-from d810.hexrays.table_utils import (
+from d810.hexrays.utils.table_utils import (
     TableEncoding,
     XorKeyInfo,
     analyze_table_encoding,

@@ -46,7 +46,6 @@ from d810.speedups.cythxr._chexrays cimport (
     CppConstMap ,
     mnumber_t,
     mcallinfo_t,
-    LOCOPT_FLAGS,
 )
 from d810.speedups.cythxr._chexrays_api cimport stack_var_name as _stack_var_name
 
@@ -136,14 +135,24 @@ cdef inline mop_off_pair_t _extract_base_and_offset(mop_t* mop):
     cdef:
         mop_off_pair_t result
 
+    if mop == NULL:
+        result.first = <mop_t_ptr>NULL
+        result.second = 0
+        return result
     if mop.t == MOPT.DEST_RESULT and mop.d != NULL and mop.d.opcode == mcode_t.m_add:
         if mop.d.l.t in (MOPT.STACK, MOPT.REGISTER):
             result.first = <mop_t_ptr>&mop.d.l
-            result.second = mop.d.r.nnn.value if mop.d.r.t == MOPT.NUMBER else 0
+            if mop.d.r.t == MOPT.NUMBER and mop.d.r.nnn != NULL:
+                result.second = mop.d.r.nnn.value
+            else:
+                result.second = 0
             return result
         if mop.d.r.t in (MOPT.STACK, MOPT.REGISTER):
             result.first = <mop_t_ptr>&mop.d.r
-            result.second = mop.d.l.nnn.value if mop.d.l.t == MOPT.NUMBER else 0
+            if mop.d.l.t == MOPT.NUMBER and mop.d.l.nnn != NULL:
+                result.second = mop.d.l.nnn.value
+            else:
+                result.second = 0
             return result
     result.first = <mop_t_ptr>NULL
     result.second = 0
@@ -264,7 +273,12 @@ cdef void _meet_preds(
             it = inm.erase(it)
 
 cdef inline void _transfer_insn(mblock_t* blk, minsn_t* ins, CppConstMap& env):
-    # conservative side-effects handling
+    # Mirror _transfer_block: clear the environment on any side-effecting
+    # instruction (except pure helpers, just like _clear_on_side_effect).
+    # The Python path clears on has_side_effects(); the previous Cython
+    # implementation only cleared on is_unknown_call(), which diverged
+    # from Python and missed writes via stores to globals/aliases.
+    _clear_on_side_effect(ins, env)
     if ins.is_unknown_call():  # or opcode test if needed
         env.clear()
         return
@@ -289,21 +303,27 @@ cdef inline void _transfer_insn(mblock_t* blk, minsn_t* ins, CppConstMap& env):
                 var_name.cat_sprnt("+%llX", pair.second)
 
     if not var_name.empty():
-        env[var_name] = const_val_t(ins.l.nnn.value, ins.l.size)
+        # Defensive: require the left operand to be an immediate number
+        # with a populated mnumber_t before reading its value.
+        if ins.l.t == MOPT.NUMBER and ins.l.nnn != NULL:
+            env[var_name] = const_val_t(ins.l.nnn.value, ins.l.size)
 
 
 cdef inline void _clear_on_side_effect(minsn_t* ins, CppConstMap& env):
     # Known pure helpers (ROL/ROR) are m_call with mop_h (HELPER) operand but
     # have no observable side effects on memory/stack — skip the blanket kill.
     cdef const char* helper_name
-    if ins.opcode == mcode_t.m_call and ins.l.t == MOPT.HELPER:
+    if ins.opcode == mcode_t.m_call and ins.l.t == MOPT.HELPER and ins.l.helper != NULL:
         helper_name = ins.l.helper
-        if (helper_name[0] == b'_' and helper_name[1] == b'_'
-                and (helper_name[2] == b'R')
-                and (helper_name[3] == b'O')
-                and (helper_name[4] == b'L' or helper_name[4] == b'R')):
+        # Length-prefixed check before reading bytes: helper_name may be
+        # a short string (e.g. "" or "_x") and the previous code would
+        # read past the null terminator and trigger a memory fault.
+        if (helper_name[0] == c'_' and helper_name[1] == c'_'
+                and helper_name[2] == c'R'
+                and helper_name[3] == c'O'
+                and (helper_name[4] == c'L' or helper_name[4] == c'R')):
             return  # pure ROL/ROR helper — preserve env
-    if ins.has_side_effects(False) and ins.opcode != mcode_t.m_stx:
+    if ins.has_side_effects() and ins.opcode != mcode_t.m_stx:
         env.clear()
 
 # Block transfer: OUTb = F_b(INb)
@@ -338,7 +358,13 @@ cdef void _transfer_block(mblock_t* blk, const CppConstMap& INb, CppConstMap& OU
                         var_name.cat_sprnt("+%llX", res_pair.second)
 
             if not var_name.empty():
-                OUTb[var_name] = const_val_t(ins.l.nnn.value, ins.l.size)
+                # Only emit a binding when the left operand is an actual
+                # immediate number with a populated mnumber_t; this matches
+                # _is_constant_stack_assignment() which already returned True.
+                if ins.l.t == MOPT.NUMBER and ins.l.nnn != NULL:
+                    OUTb[var_name] = const_val_t(ins.l.nnn.value, ins.l.size)
+                else:
+                    OUTb.erase(var_name)
 
         ins = ins.next
 
@@ -350,10 +376,13 @@ cdef bint _rewrite_instruction_c(minsn_t* ins, CppConstMap& consts):
     cdef bint can_fold
     cdef mop_t nm, zr
     cdef int dsize
+    cdef bint is_shift = ins.opcode in (mcode_t.m_shl, mcode_t.m_shr, mcode_t.m_sar)
 
-    if _cy_process_operand(&ins.l, consts): changed = <bint>True
-    if _cy_process_operand(&ins.r, consts): changed = <bint>True
-    if ins.opcode == mcode_t.m_stx and _cy_process_operand(&ins.d, consts):
+    if _cy_process_operand(&ins.l, consts, False): changed = <bint>True
+    # Shift instructions must keep the right operand size == 1 to avoid
+    # INTERR 50835.  Thread the parent opcode through to _cy_process_operand.
+    if _cy_process_operand(&ins.r, consts, is_shift): changed = <bint>True
+    if ins.opcode == mcode_t.m_stx and _cy_process_operand(&ins.d, consts, False):
         changed = <bint>True
 
     if changed:
@@ -397,6 +426,10 @@ cpdef cy_extract_assignment(object ins_py):
     if not _is_constant_stack_assignment(ins):
         return None
 
+    # Defensive NULL/structural guard: malformed instructions may expose
+    # the wrong operand shape; bail out instead of dereferencing NULL.
+    if ins.l.t != MOPT.NUMBER or ins.l.nnn == NULL:
+        return None
     cdef uint64 value = ins.l.nnn.value
     cdef int size = ins.l.size
     if ins.opcode == mcode_t.m_mov:
@@ -418,24 +451,13 @@ cpdef cy_extract_assignment(object ins_py):
     return (bname.decode('utf-8'), (value, size))
 
 
-cdef bint _cy_process_operand(mop_t* op, CppConstMap& consts):
+cdef bint _cy_process_operand(mop_t* op, CppConstMap& consts, bint is_shift_amount=False):
     """C-level recursive function to replace variables with constants.
 
-    TODO: Add is_shift_amount guard (INTERR 50835 prevention).
-    The callers _rewrite_instruction_c and cy_rewrite_instruction pass ins.r
-    to this function without indicating whether the operand is a shift-amount
-    slot.  For shift instructions (m_shl/m_shr/m_sar), the r operand must
-    have size == 1; folding a constant with a larger size triggers INTERR 50835.
-    The fix requires threading the parent opcode (or an is_shift_amount flag)
-    into _cy_process_operand so that when op is ins.r of a shift instruction
-    the make_number call uses size=1.
-    Reference implementations:
-      - Python path: forward_const_prop.py _slow_rewrite_instruction
-        (is_shift_amount flag + _SHIFT_OPCODES guard)
-      - Peephole path: fold_readonlydata.py _fold_readonly_operands_in_expr
-        (post-fixup clamps r.size to 1 after recursive fold)
-    This change requires a Cython rebuild (D810_BUILD_SPEEDUPS=1). Safe to
-    defer since Cython is disabled by default (cython_enabled=False).
+    When *is_shift_amount* is True, any constant produced for *op* is
+    created with ``size == 1``.  This is required for ``m_shl``/``m_shr``/
+    ``m_sar`` instructions whose right operand must always be one byte;
+    failing to clamp the size triggers ``INTERR 50835`` in IDA's optimizer.
     """
     cdef:
         bint changed = <bint>False
@@ -443,7 +465,7 @@ cdef bint _cy_process_operand(mop_t* op, CppConstMap& consts):
         mop_off_pair_t result
         CppConstMap.iterator it
         uint64 val
-        int size
+        int rewrite_size
         mop_t temp_mop
         mcallinfo_t* f_ptr
         size_t i
@@ -452,6 +474,8 @@ cdef bint _cy_process_operand(mop_t* op, CppConstMap& consts):
         qstring full_name
         bint const_info_found
 
+    if op == NULL:
+        return <bint>False
     if op.t == MOPT.STACK:
         name = _stack_var_name(op)
         if not name.empty():
@@ -460,7 +484,10 @@ cdef bint _cy_process_operand(mop_t* op, CppConstMap& consts):
                 if op.size not in (1, 2, 4, 8, 16):
                     return <bint>False
                 val = deref(it).second.first
-                temp_mop.make_number(val & _mask_for_bytes(op.size), op.size)
+                # Shift-amount operands must always be size 1; Hex-Rays
+                # raises INTERR 50835 otherwise.
+                rewrite_size = 1 if is_shift_amount else op.size
+                temp_mop.make_number(val & _mask_for_bytes(rewrite_size), rewrite_size)
                 op.assign(temp_mop)
                 return <bint>True
     elif op.t == MOPT.DEST_RESULT and op.d != NULL:
@@ -492,14 +519,19 @@ cdef bint _cy_process_operand(mop_t* op, CppConstMap& consts):
                 if op.size not in (1, 2, 4, 8, 16):
                     return <bint>False
                 val = deref(it).second.first
-                temp_mop.make_number(val & _mask_for_bytes(op.size), op.size)
+                rewrite_size = 1 if is_shift_amount else op.size
+                temp_mop.make_number(val & _mask_for_bytes(rewrite_size), rewrite_size)
                 op.assign(temp_mop)
                 return <bint>True
 
-        # Generic recursion on sub-operands
-        if _cy_process_operand(&op.d.l, consts):
+        # Generic recursion on sub-operands.  Only treat op.d.r as a
+        # shift-amount slot when the parent opcode is one of the shift
+        # opcodes (m_shl/m_shr/m_sar).  Anything else must keep its
+        # original size.
+        if _cy_process_operand(&op.d.l, consts, False):
             changed = <bint>True
-        if _cy_process_operand(&op.d.r, consts):
+        if _cy_process_operand(&op.d.r, consts,
+                               op.d.opcode in (mcode_t.m_shl, mcode_t.m_shr, mcode_t.m_sar)):
             changed = <bint>True
         if changed:
             op.d.optimize_solo(0)
@@ -507,7 +539,7 @@ cdef bint _cy_process_operand(mop_t* op, CppConstMap& consts):
     elif op.t == MOPT.ARGUMENT_LIST and op.f != NULL:
         f_ptr = <mcallinfo_t*>op.f
         for i in range(f_ptr.args.size()):
-             if _cy_process_operand(&f_ptr.args.at(i), consts):
+             if _cy_process_operand(&f_ptr.args.at(i), consts, False):
                  changed = <bint>True
         return changed
     return <bint>False
@@ -530,19 +562,21 @@ cpdef int cy_rewrite_instruction(object ins_py, dict consts_py):
 
     cdef CppConstMap consts
     cdef qstring key
+    cdef bint is_shift = ins.opcode in (mcode_t.m_shl, mcode_t.m_shr, mcode_t.m_sar)
     for py_key, py_val in consts_py.items():
         b_string = py_key.encode('utf-8')
         key = qstring(<char*>b_string)
         consts[key] = const_val_t(py_val[0], py_val[1])
 
-    if _cy_process_operand(&ins.l, consts):
+    if _cy_process_operand(&ins.l, consts, False):
         changed = <bint>True
-    if _cy_process_operand(&ins.r, consts):
+    # Shift instructions must keep r operand size == 1 to avoid INTERR 50835.
+    if _cy_process_operand(&ins.r, consts, is_shift):
         changed = <bint>True
-    if ins.opcode == mcode_t.m_stx and _cy_process_operand(&ins.d, consts):
+    if ins.opcode == mcode_t.m_stx and _cy_process_operand(&ins.d, consts, False):
         changed = <bint>True
     # m_call: args live in ins.d (mop_f); substitute constants into them
-    if ins.opcode == mcode_t.m_call and _cy_process_operand(&ins.d, consts):
+    if ins.opcode == mcode_t.m_call and _cy_process_operand(&ins.d, consts, False):
         changed = <bint>True
 
     # Let Hex-Rays perform local simplifications before folding whole instruction
@@ -787,15 +821,12 @@ cpdef int cy_run_full_pass(object mba_py):
         curr_blk = curr_blk.nextb
 
     if total_changes > 0:
-        # TODO: remove mba.mark_chains_dirty() + mba.optimize_local() here.
-        # The pure-Python path (_slow_run_on_function) no longer calls these
-        # because calling optimize_local inside an optblock_t callback re-enters
-        # IDA's optimizer pipeline and triggers INTERR 50835 (shift operand size
-        # verification failure on partially-transformed MBA).  This Cython path
-        # needs the same fix, but .pyx edits require a Cython rebuild which is
-        # currently disabled.  Safe to leave for now since Cython is disabled by
-        # default (cython_enabled=False).
+        # mark_chains_dirty() is still appropriate so the caller can rerun
+        # local optimization after this callback returns.  We do NOT call
+        # mba.optimize_local() here: re-entering IDA's optimizer from inside
+        # an optblock_t callback triggers INTERR 50835 on the partially
+        # transformed MBA.  This matches the pure-Python
+        # _slow_run_on_function path in forward_const_prop.py.
         mba.mark_chains_dirty()
-        mba.optimize_local(LOCOPT_FLAGS.LOCOPT_ALL)
 
     return total_changes

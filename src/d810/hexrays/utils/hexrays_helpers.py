@@ -17,6 +17,12 @@ if TYPE_CHECKING:
     from ida_hexrays import mbl_array_t, mblock_t, minsn_t, mop_t
 
 from d810.core import getLogger
+# Import bit tables early so they are bound on this module before any
+# compiled extension (loaded by CythonMode below) attempts to resolve them
+# via ``d810.hexrays.utils.hexrays_helpers.AND_TABLE`` / ``MSB_TABLE`` /
+# ``SUB_TABLE``. Extensions can otherwise observe a partially-initialised
+# helper module during partial reloads.
+from d810.core.bits import AND_TABLE, MSB_TABLE, SUB_TABLE
 from d810.core.cymode import CythonMode
 
 # Try to import Cython hash_mop if CythonMode is enabled
@@ -267,10 +273,6 @@ MINSN_TO_AST_FORBIDDEN_OPCODES: list[int] = CONTROL_FLOW_OPCODES + [
     ida_hexrays.m_und,
     ida_hexrays.m_ext,
 ]
-
-# Import constant tables from d810.core (IDA-independent)
-from d810.core.bits import AND_TABLE, MSB_TABLE, SUB_TABLE
-
 
 # Hex-Rays mop equality checking
 _EQUAL_BNOT_CACHE: dict[tuple[int, int], bool] = {}

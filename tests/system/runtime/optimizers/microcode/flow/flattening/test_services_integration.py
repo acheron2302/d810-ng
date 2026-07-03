@@ -151,6 +151,34 @@ def _find_dispatcher_context():
     return None, None, [], None
 
 
+def _validate_dispatcher_structure(dispatcher):
+    """Assert the minimum structural invariants of a Dispatcher dataclass.
+
+    Returns a list of human-readable invariant descriptions that passed
+    so test bodies can include them in failure messages.
+    """
+    invariants: list[str] = []
+    assert dispatcher is not None
+    invariants.append("dispatcher is not None")
+    assert isinstance(dispatcher, Dispatcher)
+    invariants.append("dispatcher is a Dispatcher dataclass")
+    assert dispatcher.entry_block is not None
+    invariants.append("dispatcher.entry_block is not None")
+    assert 0 <= dispatcher.entry_block.serial < dispatcher.mba.qty
+    invariants.append("dispatcher.entry_block.serial is in range")
+    assert dispatcher.state_variable is not None
+    invariants.append("dispatcher.state_variable is not None")
+    # OLLVM dispatchers must have at least 2 comparison values.
+    assert len(dispatcher.comparison_values) >= 2, (
+        f"OLLVM dispatchers must have >=2 comparison values, got "
+        f"{len(dispatcher.comparison_values)}"
+    )
+    invariants.append(
+        f"dispatcher.comparison_values has {len(dispatcher.comparison_values)} entries"
+    )
+    return invariants
+
+
 class TestOLLVMDispatcherFinderIntegration:
     """Integration tests for OLLVMDispatcherFinder.
 
@@ -164,8 +192,9 @@ class TestOLLVMDispatcherFinderIntegration:
     def test_find_dispatcher_abc_xor(self, ida_database):
         """Test finding dispatcher in abc_xor_dispatch function.
 
-        Note: The decompiled mba may have already simplified CFF patterns,
-        so this test verifies the service runs without errors and reports findings.
+        Asserts a meaningful structural result rather than only checking
+        that the finder does not crash. If no dispatchers are detected,
+        we still require the service to report ``find()`` returned cleanly.
         """
         mba = get_mba_for_function("abc_xor_dispatch")
         if mba is None:
@@ -180,28 +209,31 @@ class TestOLLVMDispatcherFinderIntegration:
 
         logger.info(f"abc_xor_dispatch: mba.qty={mba.qty}, found {len(dispatchers)} dispatchers")
 
-        # If dispatchers found, verify their properties
-        for dispatcher in dispatchers:
-            assert isinstance(dispatcher, Dispatcher)
-            assert dispatcher.entry_block is not None
-            assert dispatcher.state_variable is not None
-            logger.info(
-                f"Found dispatcher: entry={dispatcher.entry_block.serial}, "
-                f"internal={len(dispatcher.internal_blocks)}, "
-                f"exits={len(dispatcher.exit_blocks)}"
-            )
-
-        # Note: Detection may fail on fully-decompiled mba; service itself works
-        if len(dispatchers) == 0:
+        # Every detected dispatcher must satisfy the structural invariants.
+        # When no dispatcher is detected we only assert the service ran
+        # cleanly, which is the parity signal that the integration path
+        # is wired up correctly.
+        if not dispatchers:
             logger.warning(
-                "No dispatchers found - may be due to mba maturity level "
-                f"(maturity={mba.maturity})"
+                "abc_xor_dispatch: no dispatchers detected at maturity=%d; "
+                "service ran without errors",
+                mba.maturity,
+            )
+            return
+
+        for dispatcher in dispatchers:
+            _validate_dispatcher_structure(dispatcher)
+            logger.info(
+                f"abc_xor_dispatch: dispatcher entry={dispatcher.entry_block.serial}, "
+                f"internal={len(dispatcher.internal_blocks)}, "
+                f"exits={len(dispatcher.exit_blocks)}, "
+                f"comparisons={len(dispatcher.comparison_values)}"
             )
 
     def test_find_dispatcher_abc_or(self, ida_database):
         """Test finding dispatcher in abc_or_dispatch function.
 
-        Verifies the service runs correctly and logs findings.
+        Same parity contract as test_find_dispatcher_abc_xor.
         """
         mba = get_mba_for_function("abc_or_dispatch")
         if mba is None:
@@ -215,14 +247,14 @@ class TestOLLVMDispatcherFinderIntegration:
 
         logger.info(f"abc_or_dispatch: mba.qty={mba.qty}, found {len(dispatchers)} dispatchers")
 
-        # Verify any found dispatchers are valid
         for d in dispatchers:
-            assert isinstance(d, Dispatcher)
+            _validate_dispatcher_structure(d)
 
     def test_find_dispatcher_nested(self, ida_database):
         """Test finding dispatchers in nested_simple function.
 
-        Verifies the service handles nested patterns without crashing.
+        Same parity contract; nested patterns are an important stress
+        case for the outer-dispatcher selection heuristic.
         """
         mba = get_mba_for_function("nested_simple")
         if mba is None:
@@ -236,6 +268,9 @@ class TestOLLVMDispatcherFinderIntegration:
 
         logger.info(f"nested_simple: mba.qty={mba.qty}, found {len(dispatchers)} dispatchers")
 
+        for d in dispatchers:
+            _validate_dispatcher_structure(d)
+
     def test_no_dispatcher_in_simple_function(self, ida_database):
         """Test that no dispatcher is found in a non-CFF function."""
         # constant_folding_test1 is NOT control-flow flattened
@@ -248,8 +283,14 @@ class TestOLLVMDispatcherFinderIntegration:
 
         dispatchers = finder.find(context)
 
-        # Should NOT find any dispatchers in simple function
-        assert len(dispatchers) == 0, "Should not find dispatcher in non-CFF function"
+        # Strong assertion: non-CFF functions must yield zero dispatchers.
+        # This is the inverse of the CFF cases above and ensures the finder
+        # does not over-detect.
+        assert len(dispatchers) == 0, (
+            f"constant_folding_test1 is not CFF, but finder detected "
+            f"{len(dispatchers)} dispatcher(s): "
+            f"{[d.entry_block.serial for d in dispatchers]}"
+        )
 
     def test_find_single_dispatcher(self, ida_database):
         """Test the find_single method for targeted analysis."""

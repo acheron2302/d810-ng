@@ -16,6 +16,22 @@ from libc.stdint cimport uint16_t, uint64_t
 from libc.string cimport memset
 
 # --------------------------------------------------------------------------
+# Hoist ``equal_mops_ignore_size`` import out of the hot path.
+#
+# ``_check_binding_equalities`` used to import this helper on every call,
+# which means a ModuleNotFoundError or even a slow re-resolve would fire
+# each time the binding equality check ran.  Importing once at module
+# load time keeps the hot path tight.
+# --------------------------------------------------------------------------
+try:
+    from d810.hexrays.utils.hexrays_helpers import (
+        equal_mops_ignore_size as _equal_mops_ignore_size,
+    )
+except ImportError:
+    _equal_mops_ignore_size = None
+
+
+# --------------------------------------------------------------------------
 # SIMD utilities from d810_simd.h
 # --------------------------------------------------------------------------
 cdef extern from "d810_simd.h" nogil:
@@ -173,7 +189,14 @@ cdef class CMatchBindings:
         self.root_ea = None
 
     cdef inline bint add(self, object name, object mop):
-        """Add a binding. Returns False if capacity exceeded."""
+        """Add a binding. Returns False if capacity exceeded.
+
+        Returns ``False`` when the binding store is full.  Callers that
+        require a strict hard-limit can convert that to a ``ValueError``
+        after the fact; we keep returning ``False`` for backwards
+        compatibility with the existing matcher semantics where
+        overflow is a non-match.
+        """
         if self.count >= MAX_BINDINGS:
             return False
         self.names.append(name)
@@ -230,6 +253,7 @@ def match_pattern_nomut(pattern, candidate, bindings=None):
 
 cdef bint _match_recursive(object pattern, object candidate, CMatchBindings bindings):
     """Recursive structural match without mutation."""
+    cdef bint candidate_is_constant
     if pattern is None and candidate is None:
         return True
     if pattern is None or candidate is None:
@@ -238,21 +262,32 @@ cdef bint _match_recursive(object pattern, object candidate, CMatchBindings bind
     # Case 1: Pattern is a leaf
     if pattern.is_leaf():
         if pattern.is_constant():
-            # AstConstant: candidate must be a constant with matching value
+            # AstConstant: candidate must itself be a constant unless the
+            # pattern explicitly opts into capturing non-constant
+            # operands via the ``allow_non_constant_capture`` flag.
+            # The previous implementation silently bound arbitrary
+            # non-constant mops, which caused false-positive matches and
+            # downstream crashes when consumers expected a numeric mop.
             if candidate.mop is None:
                 return False
 
-            # Use is_constant() when available; fall back to mop type check
+            # Use is_constant() when available; fall back to mop type check.
+            candidate_is_constant = False
             if hasattr(candidate, "is_constant") and callable(candidate.is_constant):
-                if not candidate.is_constant():
-                    pass  # Allow for capturing constants (expected_value=None)
+                candidate_is_constant = bool(candidate.is_constant())
             else:
                 try:
                     import ida_hexrays
-                    if hasattr(candidate.mop, 't') and candidate.mop.t != ida_hexrays.mop_n:
-                        return False
+                    if hasattr(candidate.mop, 't') and candidate.mop.t == ida_hexrays.mop_n:
+                        candidate_is_constant = True
                 except ImportError:
                     pass
+
+            allow_non_constant = bool(
+                getattr(pattern, "allow_non_constant_capture", False)
+            )
+            if not candidate_is_constant and not allow_non_constant:
+                return False
 
             expected = getattr(pattern, "expected_value", None)
             if expected is not None:
@@ -321,13 +356,14 @@ cdef bint _check_binding_equalities(CMatchBindings bindings):
         mop = bindings.mops[i]
         if name in seen:
             prev_mop = seen[name]
-            try:
-                from d810.hexrays.hexrays_helpers import equal_mops_ignore_size
-                if not equal_mops_ignore_size(prev_mop, mop):
+            # ``_equal_mops_ignore_size`` is imported at module load
+            # time so the equality helper does not need to be resolved
+            # on every match.
+            if _equal_mops_ignore_size is not None:
+                if not _equal_mops_ignore_size(prev_mop, mop):
                     return False
-            except ImportError:
-                if prev_mop is not mop:
-                    return False
+            elif prev_mop is not mop:
+                return False
         else:
             seen[name] = mop
     return True

@@ -6,7 +6,7 @@ import ida_hexrays
 
 from d810 import _compat
 from d810.conf.loggers import getLogger
-from d810.hexrays.hexrays_formatters import format_mop_t, opcode_to_string, sanitize_ea
+from d810.hexrays.utils.hexrays_formatters import format_mop_t, opcode_to_string, sanitize_ea
 from d810.optimizers.microcode.instructions.peephole.handler import (
     PeepholeSimplificationRule,
 )

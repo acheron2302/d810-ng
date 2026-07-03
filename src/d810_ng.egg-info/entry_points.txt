@@ -1,2 +1,3 @@
 [console_scripts]
+install-d810-plugin = d810.install_plugin:main
 install-speedups = d810.speedups.install:main

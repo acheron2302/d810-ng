@@ -1,0 +1,101 @@
+# Forbid new internal imports of legacy duplicate modules.
+#
+# Background: Architecture consolidation (plan:
+# .kilo/plans/1782991101518-architecture-consolidation-unflattener-plan.md)
+# designates d810.hexrays.utils, d810.hexrays.hooks, d810.hexrays.mutation,
+# d810.hexrays.ir, d810.hexrays.expr, and d810.backends.mba as canonical.
+# The legacy paths (d810.hexrays.<utils...>, d810.mba.backends.*) are kept
+# as thin re-export shims for external scripts and persisted plugin usage,
+# but new internal imports must use the canonical paths.
+#
+# This rule complements the import-linter contracts. ast-grep catches
+# `from ... import` style that import-linter may miss in conditional or
+# dynamically constructed statements.
+#
+# Allowed exceptions:
+#   - The shim modules themselves (each legacy module imports its own
+#     canonical counterpart by name in a docstring; here we forbid
+#     *internal* imports).
+#   - Compatibility tests under tests/system/compat_legacy_imports/.
+#
+# Keep this rule in sync with .importlinter source_modules lists.
+
+id: no-legacy-internal-imports
+language: python
+severity: error
+
+files:
+  - "src/**/*.py"
+  - "tests/**/*.py"
+
+ignores:
+  - "src/d810/hexrays/arch_utils.py"
+  - "src/d810/hexrays/hexrays_formatters.py"
+  - "src/d810/hexrays/hexrays_helpers.py"
+  - "src/d810/hexrays/ida_utils.py"
+  - "src/d810/hexrays/table_utils.py"
+  - "src/d810/hexrays/hexrays_hooks.py"
+  - "src/d810/hexrays/ctree_hooks.py"
+  - "src/d810/hexrays/mop_snapshot.py"
+  - "src/d810/hexrays/block_helpers.py"
+  - "src/d810/hexrays/deferred_modifier.py"
+  - "src/d810/hexrays/cfg_utils.py"
+  - "src/d810/mba/backends/ida.py"
+  - "src/d810/mba/backends/z3.py"
+  - "src/d810/mba/backends/egraph.py"
+  - "src/d810/mba/backends/egglog_backend.py"
+  # Compatibility tests verify the shims and must import the legacy paths.
+  - "tests/system/compat_legacy_imports/**"
+  - "tests/system/runtime/hexrays/test_mop_snapshot.py"
+  # The unit-level mop_snapshot_guard test is the canonical compatibility
+  # test for the legacy mop_snapshot shim; it exercises the shim surface
+  # and is allowed by the existing import-linter contract.
+  - "tests/unit/test_mop_snapshot_guard.py"
+
+message: |
+  Internal imports of legacy duplicate modules are forbidden. Use the
+  canonical paths instead:
+
+    d810.hexrays.arch_utils               -> d810.hexrays.utils.arch_utils
+    d810.hexrays.hexrays_formatters       -> d810.hexrays.utils.hexrays_formatters
+    d810.hexrays.hexrays_helpers          -> d810.hexrays.utils.hexrays_helpers
+    d810.hexrays.ida_utils                -> d810.hexrays.utils.ida_utils
+    d810.hexrays.table_utils              -> d810.hexrays.utils.table_utils
+    d810.hexrays.hexrays_hooks            -> d810.hexrays.hooks.hexrays_hooks
+    d810.hexrays.ctree_hooks              -> d810.hexrays.hooks.ctree_hooks
+    d810.hexrays.mop_snapshot             -> d810.hexrays.ir.mop_snapshot
+    d810.hexrays.block_helpers            -> d810.hexrays.ir.block_helpers
+    d810.hexrays.deferred_modifier        -> d810.hexrays.mutation.deferred_modifier
+    d810.hexrays.cfg_utils                -> d810.hexrays.{ir.cfg_queries, mutation.cfg_mutations, mutation.cfg_verify, ir.mop_utils}
+    d810.mba.backends.ida                 -> d810.backends.mba.ida
+    d810.mba.backends.z3                  -> d810.backends.mba.z3
+    d810.mba.backends.egraph              -> d810.backends.mba.egraph
+    d810.mba.backends.egglog_backend      -> d810.backends.mba.egglog_backend
+
+rule:
+  any:
+    - pattern: from d810.hexrays.arch_utils import $$$
+    - pattern: from d810.hexrays.hexrays_formatters import $$$
+    - pattern: from d810.hexrays.hexrays_helpers import $$$
+    - pattern: from d810.hexrays.ida_utils import $$$
+    - pattern: from d810.hexrays.table_utils import $$$
+    - pattern: from d810.hexrays.hexrays_hooks import $$$
+    - pattern: from d810.hexrays.ctree_hooks import $$$
+    - pattern: from d810.hexrays.mop_snapshot import $$$
+    - pattern: from d810.hexrays.block_helpers import $$$
+    - pattern: from d810.hexrays.deferred_modifier import $$$
+    - pattern: from d810.hexrays.cfg_utils import $$$
+    - pattern: from d810.mba.backends.ida import $$$
+    - pattern: from d810.mba.backends.z3 import $$$
+    - pattern: from d810.mba.backends.egraph import $$$
+    - pattern: from d810.mba.backends.egglog_backend import $$$
+
+note: |
+  This rule enforces the canonical-only internal-import policy introduced
+  by the architecture consolidation plan. Legacy modules remain in place as
+  thin shims for external scripts; new code must use the canonical paths.
+
+  If you need to import a legacy path legitimately (e.g., a dedicated
+  compatibility test), place the test under
+  ``tests/system/compat_legacy_imports/`` and add the path to the
+  ``ignores`` block above.

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import ida_hexrays
 
 from d810.core.stats import OptimizationStatistics
-from d810.hexrays.hexrays_hooks import InstructionOptimizerManager
+from d810.hexrays.hooks.hexrays_hooks import InstructionOptimizerManager
 from d810.optimizers.microcode.instructions.pattern_matching.handler import PatternOptimizer
 
 
@@ -73,7 +73,7 @@ def _make_block(func_ea: int) -> SimpleNamespace:
 
 def test_instruction_scope_cache_is_used_per_function_and_maturity(monkeypatch):
     monkeypatch.setattr(
-        "d810.hexrays.hexrays_hooks.InstructionVisitorManager",
+        "d810.hexrays.hooks.hexrays_hooks.InstructionVisitorManager",
         lambda _optimizer: SimpleNamespace(),
     )
     manager = InstructionOptimizerManager(OptimizationStatistics(), Path("."))

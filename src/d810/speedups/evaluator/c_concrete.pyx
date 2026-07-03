@@ -27,6 +27,7 @@ import ida_hexrays
 from d810.core import getLogger
 from d810.errors import AstEvaluationException
 from d810.core.bits import (
+    AND_TABLE,
     get_add_cf,
     get_add_of,
     get_parity_flag,
@@ -34,7 +35,6 @@ from d810.core.bits import (
     signed_to_unsigned,
     unsigned_to_signed,
 )
-from d810.hexrays.hexrays_helpers import AND_TABLE
 from d810.evaluator.helpers.rotate import _RotateHelper as _RotateHelperLookup
 
 logger = getLogger(__name__)
@@ -162,7 +162,8 @@ cdef class CythonConcreteEvaluator:
 
         Returns the constant value stored in the mop for ``AstConstant``
         nodes, or looks up the variable's value from *dict_index_to_value*
-        for ``AstLeaf`` nodes.
+        for ``AstLeaf`` nodes.  Returns ``None`` if a variable leaf has no
+        binding (matching the pure-Python :class:`ConcreteEvaluator`).
         """
         # AstConstant: prefer concrete mop value, otherwise fall back to expected_value
         if isinstance(leaf, _AstConstant):
@@ -173,12 +174,10 @@ cdef class CythonConcreteEvaluator:
         if leaf.is_constant() and leaf.mop is not None:
             return leaf.mop.nnn.value
         assert leaf.ast_index is not None
-        val = dict_index_to_value.get(leaf.ast_index)
-        if val is None:
-            raise AstEvaluationException(
-                f"Variable leaf ast_index={leaf.ast_index} not found in env"
-            )
-        return val
+        # Match Python ConcreteEvaluator: missing leaf binding is None,
+        # not an exception.  This is required so callers can still proceed
+        # with partial constant evaluation in z3 flows.
+        return dict_index_to_value.get(leaf.ast_index)
 
     cdef inline object _eval_node(self, object node, dict dict_index_to_value):
         """Evaluate an interior ``AstNode``.
@@ -208,8 +207,10 @@ cdef class CythonConcreteEvaluator:
             lv = self.evaluate(node.left, dict_index_to_value)
             return None if lv is None else (-lv) & res_mask
         elif node.opcode == ida_hexrays.m_lnot:
+            # Logical NOT: 1 when the operand is zero, 0 otherwise (!x in C).
+            # Mask the result to dest_size to match the Python path exactly.
             lv = self.evaluate(node.left, dict_index_to_value)
-            return None if lv is None else lv != 0
+            return None if lv is None else int(lv == 0) & res_mask
         elif node.opcode == ida_hexrays.m_bnot:
             lv = self.evaluate(node.left, dict_index_to_value)
             return None if lv is None else (lv ^ res_mask) & res_mask
@@ -246,7 +247,11 @@ cdef class CythonConcreteEvaluator:
         elif node.opcode == ida_hexrays.m_udiv and node.right is not None:
             lv = self.evaluate(node.left, dict_index_to_value)
             rv = self.evaluate(node.right, dict_index_to_value)
-            return None if lv is None or rv is None else (lv // rv) & res_mask
+            # Match Python ConcreteEvaluator: missing operands or zero
+            # divisor both yield None (rather than raising).
+            if lv is None or rv is None or rv == 0:
+                return None
+            return (lv // rv) & res_mask
         elif node.opcode == ida_hexrays.m_sdiv and node.right is not None:
             lv = self.evaluate(node.left, dict_index_to_value)
             rv = self.evaluate(node.right, dict_index_to_value)
@@ -254,6 +259,8 @@ cdef class CythonConcreteEvaluator:
                 return None
             left_value_signed = unsigned_to_signed(lv, node.left.dest_size)
             right_value_signed = unsigned_to_signed(rv, node.right.dest_size)
+            if right_value_signed == 0:
+                return None
             quotient = (abs(left_value_signed) // abs(right_value_signed)) * (
                 -1 if (left_value_signed < 0) ^ (right_value_signed < 0) else 1
             )
@@ -261,7 +268,9 @@ cdef class CythonConcreteEvaluator:
         elif node.opcode == ida_hexrays.m_umod and node.right is not None:
             lv = self.evaluate(node.left, dict_index_to_value)
             rv = self.evaluate(node.right, dict_index_to_value)
-            return None if lv is None or rv is None else (lv % rv) & res_mask
+            if lv is None or rv is None or rv == 0:
+                return None
+            return (lv % rv) & res_mask
         elif node.opcode == ida_hexrays.m_smod and node.right is not None:
             lv = self.evaluate(node.left, dict_index_to_value)
             rv = self.evaluate(node.right, dict_index_to_value)
@@ -269,6 +278,8 @@ cdef class CythonConcreteEvaluator:
                 return None
             left_value_signed = unsigned_to_signed(lv, node.left.dest_size)
             right_value_signed = unsigned_to_signed(rv, node.right.dest_size)
+            if right_value_signed == 0:
+                return None
             quotient = (abs(left_value_signed) // abs(right_value_signed)) * (
                 -1 if (left_value_signed < 0) ^ (right_value_signed < 0) else 1
             )

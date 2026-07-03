@@ -22,14 +22,14 @@ from d810.expr.utils import (
     signed_to_unsigned,
     unsigned_to_signed,
 )
-from d810.hexrays.cfg_utils import get_block_serials_by_address
-from d810.hexrays.hexrays_formatters import (
+from d810.hexrays.ir.cfg_queries import get_block_serials_by_address
+from d810.hexrays.utils.hexrays_formatters import (
     format_minsn_t,
     format_mop_t,
     mop_type_to_string,
     opcode_to_string,
 )
-from d810.hexrays.hexrays_helpers import (
+from d810.hexrays.utils.hexrays_helpers import (
     AND_TABLE,
     CONDITIONAL_JUMP_OPCODES,
     CONTROL_FLOW_OPCODES,

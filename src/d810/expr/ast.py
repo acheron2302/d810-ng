@@ -20,7 +20,7 @@ from d810.expr.utils import (
     signed_to_unsigned,
     unsigned_to_signed,
 )
-from d810.hexrays.hexrays_formatters import (
+from d810.hexrays.utils.hexrays_formatters import (
     format_minsn_t,
     format_mop_t,
     mop_tree,
@@ -28,7 +28,7 @@ from d810.hexrays.hexrays_formatters import (
     opcode_to_string,
     sanitize_ea,
 )
-from d810.hexrays.hexrays_helpers import (
+from d810.hexrays.utils.hexrays_helpers import (
     AND_TABLE,
     MBA_RELATED_OPCODES,
     MINSN_TO_AST_FORBIDDEN_OPCODES,

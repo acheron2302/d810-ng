@@ -71,6 +71,8 @@ cdef uint64 _hash_mop_ptr(const mop_t* op,
     if t == MOPT.REGISTER:   # microregister
         return _mix64(h, <uint64>op.r)
     if t == MOPT.NUMBER:   # immediate
+        if op.nnn == NULL:
+            return _mix64(h, 0xBAD0BAD0ULL)
         return _mix64(h, _mask_nbits(<uint64>op.nnn.value, sz))
     if t == MOPT.GLOBAL:   # global EA
         return _mix64(h, <uint64>op.g)
@@ -83,15 +85,21 @@ cdef uint64 _hash_mop_ptr(const mop_t* op,
         return _mix64(h, <uint64>op.l.off)
     if t == MOPT.ADDRESS:   # address-of
         ap = op.a
+        if ap == NULL:
+            return _mix64(h, 0xADD0ADD0ULL)
         h = _mix64(h, <uint64>ap.insize)
         h = _mix64(h, <uint64>ap.outsize)
         return _mix64(h, _hash_mop_ptr(<const mop_t*>ap, func_ea, insn_memo, depth+1))
     if t == MOPT.PAIR:   # pair (low/high)
         pr = op.pair
+        if pr == NULL:
+            return _mix64(h, 0xBAA1BAA1ULL)
         h = _mix64(h, _hash_mop_ptr(<const mop_t*>&pr.lop, func_ea, insn_memo, depth+1))
         return _mix64(h, _hash_mop_ptr(<const mop_t*>&pr.hop, func_ea, insn_memo, depth+1))
     if t == MOPT.DEST_RESULT:   # result of subinstruction
         m = op.d
+        if m == NULL:
+            return _mix64(h, 0xDEE0DEE0ULL)
         key = <uintptr_t>m
         it = insn_memo.find(key)
         if it != insn_memo.end():
