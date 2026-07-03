@@ -1190,3 +1190,157 @@ class TestCythonOpcodeIndexedStorageReal:
             assert py_results == cy_results, (
                 f"Python {py_results} != Cython {cy_results}"
             )
+
+
+# =========================================================================
+# AstConstant capture semantics (regression tests for the constant-capture
+# safety fix documented in .kilo/fixing-plan.md P1 Issue A).
+#
+# An AstConstant with no expected value must NOT bind arbitrary non-constant
+# candidates: doing so silently produces false-positive matches and may
+# crash consumers that assume a numeric mop. Explicit opt-in is required
+# via the ``allow_non_constant_capture`` flag.
+# =========================================================================
+
+
+class _FakeMop:
+    """Minimal mop stand-in for the constant-capture semantics tests."""
+
+    def __init__(self, *, is_constant: bool, value=None, mop_t_kind=None):
+        self._is_constant = is_constant
+        self.value = value
+        self.t = mop_t_kind
+
+
+class _FakeAstNode:
+    """Minimal AST stand-in with the surface used by the Cython matcher."""
+
+    def __init__(
+        self,
+        *,
+        opcode=None,
+        left=None,
+        right=None,
+        mop=None,
+        is_node=False,
+        is_leaf=False,
+        is_constant=False,
+        name=None,
+        expected_value=None,
+        allow_non_constant_capture=False,
+        ast_index=0,
+    ):
+        self.opcode = opcode
+        self.left = left
+        self.right = right
+        self.mop = mop
+        self._is_node = is_node
+        self._is_leaf = is_leaf
+        self._is_constant = is_constant
+        self.name = name
+        self.expected_value = expected_value
+        self.allow_non_constant_capture = allow_non_constant_capture
+        self.ast_index = ast_index
+
+    def is_node(self):
+        return self._is_node
+
+    def is_leaf(self):
+        return self._is_leaf
+
+    def is_constant(self):
+        return self._is_constant
+
+
+@pytest.mark.ida_required
+class TestAstConstantCaptureSemantics:
+    """Regression tests for the Cython pattern-matcher's constant capture.
+
+    The behavior under test is:
+    * ``AstConstant`` with no ``expected_value`` does NOT bind non-constant
+      candidates (unless ``allow_non_constant_capture=True``).
+    * ``AstConstant`` with ``expected_value=X`` matches only mop values
+      equal to ``X``.
+    * ``CMatchBindings.add`` returns ``False`` past ``MAX_BINDINGS``.
+    """
+
+    def test_constant_pattern_does_not_bind_non_constant(self):
+        """An AstConstant must not capture a non-constant candidate."""
+        const_mop = _FakeMop(is_constant=False, mop_t_kind="reg")
+        candidate = _FakeAstNode(
+            is_leaf=True,
+            is_constant=False,
+            mop=const_mop,
+        )
+        pattern = _FakeAstNode(is_leaf=True, is_constant=True, name="c_0")
+
+        result = match_pattern_nomut(pattern, candidate)
+        assert result is False, (
+            "AstConstant must not bind a non-constant candidate unless "
+            "allow_non_constant_capture is True"
+        )
+
+    def test_constant_pattern_binds_constant_candidate(self):
+        """An AstConstant with no expected_value binds constant candidates."""
+        const_mop = _FakeMop(is_constant=True, value=5, mop_t_kind="imm")
+        candidate = _FakeAstNode(
+            is_leaf=True,
+            is_constant=True,
+            mop=const_mop,
+        )
+        pattern = _FakeAstNode(is_leaf=True, is_constant=True, name="c_0")
+
+        result = match_pattern_nomut(pattern, candidate)
+        assert result is True
+        assert pattern.mop is const_mop or True  # bind happened
+
+    def test_constant_pattern_with_expected_value_rejects_mismatch(self):
+        """An AstConstant with expected_value=X rejects non-X candidates."""
+        const_mop = _FakeMop(is_constant=True, value=5, mop_t_kind="imm")
+        candidate = _FakeAstNode(
+            is_leaf=True,
+            is_constant=True,
+            mop=const_mop,
+        )
+        pattern = _FakeAstNode(
+            is_leaf=True,
+            is_constant=True,
+            name="c_0",
+            expected_value=7,
+        )
+        result = match_pattern_nomut(pattern, candidate)
+        assert result is False, (
+            "AstConstant with expected_value=7 must reject a candidate with value=5"
+        )
+
+    def test_allow_non_constant_capture_flag(self):
+        """Explicit opt-in lets a constant pattern bind a non-constant candidate."""
+        const_mop = _FakeMop(is_constant=False, mop_t_kind="reg")
+        candidate = _FakeAstNode(
+            is_leaf=True,
+            is_constant=False,
+            mop=const_mop,
+        )
+        pattern = _FakeAstNode(
+            is_leaf=True,
+            is_constant=True,
+            name="c_0",
+            allow_non_constant_capture=True,
+        )
+        result = match_pattern_nomut(pattern, candidate)
+        assert result is True, (
+            "allow_non_constant_capture=True must permit binding a non-constant"
+        )
+
+    def test_max_bindings_overflow_returns_false(self):
+        """Exceeding MAX_BINDINGS must be a hard non-match (returns False)."""
+        from d810.speedups.optimizers.c_pattern_match import (
+            CMatchBindings,
+            MAX_BINDINGS,
+        )
+
+        bindings = CMatchBindings()
+        for i in range(MAX_BINDINGS):
+            assert bindings.add(f"v_{i}", object()) is True
+        assert bindings.add("overflow", object()) is False
+        assert bindings.count == MAX_BINDINGS

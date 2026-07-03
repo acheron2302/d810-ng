@@ -248,6 +248,19 @@ class InstructionOptimizer(Registrant, typing.Generic[T_Rule]):
                     format_minsn_t(ins),
                     e,
                 )
+            except Exception:
+                # Safety net: never let an unexpected exception (such as the
+                # ``AttributeError: 'NoneType' object has no attribute 'items'``
+                # observed in Z3ConstantOptimization) escape the per-rule
+                # dispatch and cross the SWIG director boundary.  Without
+                # this the whole IDA decompile callback aborts with
+                # ``Exception in SwigDirector_optinsn_t::func``.
+                optimizer_logger.exception(
+                    "Unhandled exception during rule %s in maturity %s for instruction %s",
+                    rule,
+                    maturity_to_string(self.cur_maturity),
+                    format_minsn_t(ins),
+                )
         return None
 
     @property

@@ -5,7 +5,9 @@ import ida_hexrays
 
 from d810.conf.loggers import getLogger
 from d810.errors import D810Z3Exception
-from d810.expr.ast import AstLeaf, AstNode, minsn_to_ast, mop_to_ast
+from d810.hexrays.expr.ast import AstLeaf, AstNode
+from d810.hexrays.ir.minsn_utils import minsn_to_ast
+from d810.hexrays.ir.mop_utils import mop_to_ast
 from d810.hexrays.utils.hexrays_formatters import (
     format_minsn_t,
     format_mop_t,

@@ -150,3 +150,26 @@ forbidden_modules =
     d810.mba.backends.z3
     d810.mba.backends.egraph
     d810.mba.backends.egglog_backend
+
+[importlinter:contract:no-legacy-d810-expr-ast]
+name = Production source must import the canonical d810.hexrays.expr.ast dispatcher
+type = forbidden
+source_modules =
+    d810.optimizers
+    d810.evaluator
+    d810.expr
+    d810.backends
+    d810.recon
+    d810.speedups
+    d810.cfg
+    d810.manager
+forbidden_modules =
+    d810.expr.ast
+ignore_imports =
+    # The shim itself naturally re-exports from the canonical module.
+    d810.expr.ast -> d810.hexrays.expr.ast
+    d810.expr.ast -> d810.hexrays.ir.minsn_utils
+    d810.expr.ast -> d810.hexrays.ir.mop_utils
+    d810.expr.ast -> d810.core
+    # The dedicated compatibility test verifies the shim's identity contract.
+    tests.system.runtime.test_ast_class_identity -> d810.expr.ast

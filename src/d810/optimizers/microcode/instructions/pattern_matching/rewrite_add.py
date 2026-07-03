@@ -1,6 +1,6 @@
 from ida_hexrays import *
 
-from d810.expr.ast import AstConstant, AstLeaf, AstNode
+from d810.hexrays.expr.ast import AstConstant, AstLeaf, AstNode
 from d810.hexrays.utils.hexrays_helpers import (
     AND_TABLE,
     equal_bnot_mop,

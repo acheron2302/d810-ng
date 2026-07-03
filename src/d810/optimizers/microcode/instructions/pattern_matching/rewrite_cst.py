@@ -1,4 +1,4 @@
-from d810.expr.ast import AstConstant, AstLeaf, AstNode
+from d810.hexrays.expr.ast import AstConstant, AstLeaf, AstNode
 from d810.hexrays.utils.hexrays_helpers import (
     AND_TABLE,
     SUB_TABLE,

@@ -48,10 +48,58 @@ cdef tuple _N_SIGS = tuple(["N"] * (2**k) for k in range(8))
 
 
 cdef inline list _get_n_sig(int k):
-    """Return cached ["N"] * (2**k) list, or compute if k >= 8."""
+    """Return cached ["N"] * (2^k) list, or compute if k >= 8."""
     if k < 8:
         return _N_SIGS[k]
     return ["N"] * (2**k)
+
+
+def _sub_ast_dict_or_empty(ast):
+    """Return ``ast.sub_ast_info_by_index`` if it is a ``dict``, else ``{}``.
+
+    Cython ``cdef public dict`` slots default to ``None`` until the owning
+    class explicitly assigns one.  ``AstProxy`` instances can therefore expose
+    a ``None`` structural map.  Iterating ``None`` would raise
+    ``AttributeError: 'NoneType' object has no attribute 'items'`` which
+    crosses the SWIG director boundary and crashes the IDA decompile
+    callback.  Returning ``{}`` keeps ``compute_sub_ast`` total.
+    """
+    if ast is None:
+        return {}
+    sub = getattr(ast, "sub_ast_info_by_index", None)
+    if isinstance(sub, dict):
+        return sub
+    return {}
+
+
+def _merge_sub_ast_info(dst, child):
+    """Merge ``child``'s structural map into ``dst`` in place.
+
+    The merge is proxy-safe: ``child`` may be ``None``, an ``AstBase`` whose
+    structural map is ``None``/missing, or an ``AstProxy`` wrapping either
+    case.  Uses are accumulated on existing ``AstInfo`` entries instead of
+    being reset to zero, preserving ``AstInfo.number_of_use`` semantics from
+    the original implementation.
+    """
+    if child is None:
+        return
+    try:
+        child.compute_sub_ast()
+    except Exception:
+        # Never let a child crash propagate out of the structural map build.
+        logger.debug(
+            "compute_sub_ast failed for child %r while merging into %r",
+            child,
+            dst,
+            exc_info=True,
+        )
+        return
+    for ast_index, ast_info in _sub_ast_dict_or_empty(child).items():
+        existing = dst.get(ast_index)
+        if existing is None:
+            dst[ast_index] = AstInfo(ast_info.ast, ast_info.number_of_use)
+        else:
+            existing.number_of_use += ast_info.number_of_use
 
 
 def get_constant_mop(value: int, size: int) -> ida_hexrays.mop_t:
@@ -218,27 +266,19 @@ cdef class AstNode(AstBase):
         return self.mop.d.d.size if self.mop else 0
 
     def compute_sub_ast(self):
+        # Always start from a fresh structural map so stale entries from
+        # previous calls (or a shared ``AstProxy`` target) cannot leak in.
         self.sub_ast_info_by_index = {}
-        assert self.ast_index is not None
-        self.sub_ast_info_by_index[self.ast_index] = AstInfo(self, 1)
+        if self.ast_index is not None:
+            self.sub_ast_info_by_index[self.ast_index] = AstInfo(self, 1)
 
-        if self.left is not None:
-            self.left.compute_sub_ast()
-            for ast_index, ast_info in self.left.sub_ast_info_by_index.items():
-                if ast_index not in self.sub_ast_info_by_index.keys():
-                    self.sub_ast_info_by_index[ast_index] = AstInfo(ast_info.ast, 0)
-                self.sub_ast_info_by_index[
-                    ast_index
-                ].number_of_use += ast_info.number_of_use
-
-        if self.right is not None:
-            self.right.compute_sub_ast()
-            for ast_index, ast_info in self.right.sub_ast_info_by_index.items():
-                if ast_index not in self.sub_ast_info_by_index.keys():
-                    self.sub_ast_info_by_index[ast_index] = AstInfo(ast_info.ast, 0)
-                self.sub_ast_info_by_index[
-                    ast_index
-                ].number_of_use += ast_info.number_of_use
+        # ``left``, ``right``, and ``dst`` can be ``None``, a plain ``AstBase``,
+        # or an ``AstProxy`` whose ``sub_ast_info_by_index`` slot may itself be
+        # ``None``.  Use the proxy-safe merge helper so we never call ``.items()``
+        # on ``None`` and never double-add uses to the same ``AstInfo``.
+        _merge_sub_ast_info(self.sub_ast_info_by_index, self.left)
+        _merge_sub_ast_info(self.sub_ast_info_by_index, self.right)
+        _merge_sub_ast_info(self.sub_ast_info_by_index, getattr(self, "dst", None))
 
     def get_information(self):
         leaf_info_list = []
@@ -1345,6 +1385,27 @@ cdef class AstProxy(AstBase):
         self._ensure_mutable()
         self._target.ast_index = value
 
+    # ------------------------------------------------------------------
+    # Structural-map forwarding.
+    #
+    # ``AstBase.sub_ast_info_by_index`` is a ``cdef public dict`` slot that
+    # defaults to ``None`` until populated.  Without explicit forwarding,
+    # callers that read ``proxy.sub_ast_info_by_index.items()`` crash with
+    # ``AttributeError: 'NoneType' object has no attribute 'items'`` which
+    # propagates across the SWIG director boundary and aborts the IDA
+    # decompile callback.  Forward the access so callers always observe a
+    # real ``dict`` (empty when the target has not populated one yet).
+    # ------------------------------------------------------------------
+
+    @property
+    def sub_ast_info_by_index(self):  # type: ignore[override]
+        return _sub_ast_dict_or_empty(self._target)
+
+    @sub_ast_info_by_index.setter
+    def sub_ast_info_by_index(self, value):  # noqa: ANN001
+        self._ensure_mutable()
+        self._target.sub_ast_info_by_index = value if isinstance(value, dict) else {}
+
 
 cdef class AstBuilderContext:
     """
@@ -2048,7 +2109,19 @@ def minsn_to_ast(instruction: ida_hexrays.minsn_t) -> AstProxy | None:
         ins_mop.create_from_insn(instruction)
 
         if instruction.opcode == ida_hexrays.m_mov:
-            tmp = AstNode(ida_hexrays.m_mov, mop_to_ast(ins_mop))
+            # Guard against ``mop_to_ast`` returning ``None`` so we never wrap a
+            # ``None`` child in an ``AstNode`` (which would later crash inside
+            # ``compute_sub_ast`` when iterating ``left.sub_ast_info_by_index``).
+            left_ast = mop_to_ast(ins_mop)
+            if left_ast is None:
+                if logger.debug_on:
+                    logger.debug(
+                        "[minsn_to_ast] m_mov: mop_to_ast returned None for %s @ 0x%x",
+                        format_minsn_t(instruction),
+                        instruction.ea,
+                    )
+                return None
+            tmp = AstNode(ida_hexrays.m_mov, left_ast)
             tmp.mop = ins_mop
             tmp.dest_size = instruction.d.size
             tmp.ea = instruction.ea

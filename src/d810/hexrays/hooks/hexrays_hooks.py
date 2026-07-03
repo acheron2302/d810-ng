@@ -330,6 +330,17 @@ class InstructionOptimizerManager(ida_hexrays.optinsn_t):
                     format_minsn_t(ins), self._last_optimizer_tried, e
                 )
             )
+        except Exception:
+            # Final SWIG-boundary safety net.  Rule-level handlers should
+            # already have contained their own exceptions, but if anything
+            # slips through (e.g. a brand-new rule without a per-rule
+            # ``try``), we must not let it bubble up into
+            # ``SwigDirector_optinsn_t::func`` and abort the decompile.
+            optimizer_logger.exception(
+                "Unhandled exception while optimizing ins {0} with {1}".format(
+                    format_minsn_t(ins), self._last_optimizer_tried
+                )
+            )
         return False
 
     # statistics are managed centrally via the stats object

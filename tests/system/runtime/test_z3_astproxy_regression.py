@@ -67,6 +67,15 @@ class TestZ3AstProxyRegression:
 
         captured = capsys.readouterr()
         output = f"{captured.out}\n{captured.err}"
+        # The original crash signature: the SWIG director reported an
+        # AttributeError raised inside ``AstNode.compute_sub_ast`` while
+        # iterating ``sub_ast_info_by_index.items()`` on a ``None``.
         assert "SwigDirector_optinsn_t::func" not in output
-        assert "expected d810.speedups.expr.c_ast.AstNode, got d810.speedups.expr.c_ast.AstProxy" not in output
+        assert "AttributeError" not in output
+        assert "'NoneType' object has no attribute 'items'" not in output
+        # Pre-fix class-identity crash from the earlier addendum.
+        assert (
+            "expected d810.speedups.expr.c_ast.AstNode, "
+            "got d810.speedups.expr.c_ast.AstProxy"
+        ) not in output
 

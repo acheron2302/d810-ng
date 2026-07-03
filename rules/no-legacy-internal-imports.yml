@@ -40,6 +40,8 @@ ignores:
   - "src/d810/hexrays/block_helpers.py"
   - "src/d810/hexrays/deferred_modifier.py"
   - "src/d810/hexrays/cfg_utils.py"
+  # The d810.expr.ast shim re-exports from the canonical module by design.
+  - "src/d810/expr/ast.py"
   - "src/d810/mba/backends/ida.py"
   - "src/d810/mba/backends/z3.py"
   - "src/d810/mba/backends/egraph.py"
@@ -51,6 +53,9 @@ ignores:
   # test for the legacy mop_snapshot shim; it exercises the shim surface
   # and is allowed by the existing import-linter contract.
   - "tests/unit/test_mop_snapshot_guard.py"
+  # Dedicated compatibility tests for the legacy d810.expr.ast shim.
+  - "tests/unit/test_legacy_shims.py"
+  - "tests/system/runtime/test_ast_class_identity.py"
 
 message: |
   Internal imports of legacy duplicate modules are forbidden. Use the
@@ -67,6 +72,7 @@ message: |
     d810.hexrays.block_helpers            -> d810.hexrays.ir.block_helpers
     d810.hexrays.deferred_modifier        -> d810.hexrays.mutation.deferred_modifier
     d810.hexrays.cfg_utils                -> d810.hexrays.{ir.cfg_queries, mutation.cfg_mutations, mutation.cfg_verify, ir.mop_utils}
+    d810.expr.ast                         -> d810.hexrays.expr.ast
     d810.mba.backends.ida                 -> d810.backends.mba.ida
     d810.mba.backends.z3                  -> d810.backends.mba.z3
     d810.mba.backends.egraph              -> d810.backends.mba.egraph
@@ -85,6 +91,7 @@ rule:
     - pattern: from d810.hexrays.block_helpers import $$$
     - pattern: from d810.hexrays.deferred_modifier import $$$
     - pattern: from d810.hexrays.cfg_utils import $$$
+    - pattern: from d810.expr.ast import $$$
     - pattern: from d810.mba.backends.ida import $$$
     - pattern: from d810.mba.backends.z3 import $$$
     - pattern: from d810.mba.backends.egraph import $$$

@@ -10,7 +10,7 @@ import ida_hexrays
 
 import d810.core.typing as typing
 from d810.core import getLogger
-from d810.hexrays.expr.p_ast import AstNode
+from d810.hexrays.expr.ast import AstNode
 from d810.hexrays.ir.mop_utils import mop_to_ast
 from d810.hexrays.utils.hexrays_formatters import (
     format_minsn_t,
@@ -82,7 +82,19 @@ def _py_slow_minsn_to_ast(instruction: ida_hexrays.minsn_t) -> typing.Any | None
         ins_mop.create_from_insn(instruction)
 
         if instruction.opcode == ida_hexrays.m_mov:
-            tmp = AstNode(ida_hexrays.m_mov, mop_to_ast(ins_mop))
+            # Guard against ``mop_to_ast`` returning ``None`` so we never wrap a
+            # ``None`` child in an ``AstNode`` (which would later crash inside
+            # ``compute_sub_ast`` when iterating ``left.sub_ast_info_by_index``).
+            left_ast = mop_to_ast(ins_mop)
+            if left_ast is None:
+                if logger.debug_on:
+                    logger.debug(
+                        "[minsn_to_ast] m_mov: mop_to_ast returned None for %s @ 0x%x",
+                        format_minsn_t(instruction),
+                        instruction.ea,
+                    )
+                return None
+            tmp = AstNode(ida_hexrays.m_mov, left_ast)
             tmp.mop = ins_mop
             tmp.dest_size = instruction.d.size
             tmp.ea = instruction.ea
