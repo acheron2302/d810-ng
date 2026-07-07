@@ -15,6 +15,65 @@ from d810.core import getLogger
 
 early_rule_logger = getLogger("D810.early_rule")
 
+class SetGlobalVariablesToZeroIfInRange(EarlyRule):
+    CATEGORY = "Early Transforms"
+    CONFIG_SCHEMA = EarlyRule.CONFIG_SCHEMA + (
+        ConfigParam(
+            "ro_dword_min_ea", str, "", "Minimum address for RO data range (hex)"
+        ),
+        ConfigParam(
+            "ro_dword_max_ea", str, "", "Maximum address for RO data range (hex)"
+        ),
+    )
+    DESCRIPTION = "Replace mov &($sym[+off]), dst with value zero if the addr in range ro_dword_min_ea to ro_dword_max_ea"
+
+
+    @property
+    def PATTERN(self) -> AstNode:
+        """Return the pattern to match."""
+        return AstNode(ida_hexrays.m_mov, AstLeaf("ro_dword"))
+
+    @property
+    def REPLACEMENT_PATTERN(self) -> AstNode:
+        return AstNode(ida_hexrays.m_mov, AstConstant("val_res"))
+
+    def __init__(self):
+        super().__init__()
+        self.maturities = [ida_hexrays.MMAT_PREOPTIMIZED]
+
+    def _generate_pattern_variations(self) -> list[AstNode]:
+        if self.PATTERN is None:
+            return []
+        return [self.PATTERN]
+    
+    def check_candidate(self, candidate) -> bool:
+        if (self.ro_dword_min_ea is None) or (self.ro_dword_max_ea is None):
+            return False
+        leaf = candidate["ro_dword"]
+        if leaf is None:
+            return False
+        mop = leaf.mop
+        if mop is None:
+            return False
+        mop_t = getattr(mop, "t", None)
+        if mop_t != ida_hexrays.mop_v:
+            return False
+        mem_read_address = getattr(mop, "g", None)
+        if mem_read_address is None:
+            return False
+        if not (self.ro_dword_min_ea <= mem_read_address <= self.ro_dword_max_ea):
+            return False
+
+        num = 0
+        if num is None:
+            return False
+        size = mop.size or 0
+        if size == 0:
+            return False
+        early_rule_logger.info(f"Found candidate and changing num to size: {num}:{size}")
+        candidate.add_constant_leaf("val_res", num, size)
+        return True
+
 
 class ReplaceReadonlyAddressOfWithImmediate2(EarlyRule):
     CATEGORY = "Early Transforms"

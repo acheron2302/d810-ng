@@ -917,7 +917,7 @@
     ],
     "blk_rules": [
         {
-            "name": "Unflattener",
+            "name": "HodurUnflattener",
             "is_activated": true,
             "config": {}
         },

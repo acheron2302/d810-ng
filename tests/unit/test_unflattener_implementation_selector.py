@@ -89,9 +89,15 @@ def _extract_selector():
     # Also bind the logger used inside the method body.
     unflat_logger = logging.getLogger("test.unflattener.selector")
 
+    # Provide a no-op implementation of the per-process dedupe helper
+    # so the lifted source resolves the name without doing real work.
+    def _warn_invalid_implementation_once(_value):
+        return None
+
     namespace: dict = {
         "Unflattener": stub,
         "unflat_logger": unflat_logger,
+        "_warn_invalid_implementation_once": _warn_invalid_implementation_once,
         "__name__": "test_unflattener_selector",
     }
     exec(compile(method_src, str(UNFLATTENER_PATH), "exec"), namespace)

@@ -178,6 +178,16 @@ def ast_to_z3_expression(ast: AstNode | AstLeaf | None, use_bitvecval=False):
                 0, 32
             )  # ordinary “<” is signed-less-than in Z3Py
             return z3.If(is_negative, z3.BitVecVal(1, 32), z3.BitVecVal(0, 32))
+        case ida_hexrays.m_seto:
+            # Signed overflow flag for `left - right`. Mirrors `get_sub_of()`.
+            res = left - right
+            sign_bit = left.size() - 1
+            of_bv = (left ^ res) & (left ^ right)
+            of_bit = typing.cast(
+                z3.BitVecRef, z3.Extract(sign_bit, sign_bit, of_bv)
+            )
+            of_is_set = of_bit == z3.BitVecVal(1, 1)
+            return z3.If(of_is_set, z3.BitVecVal(1, 32), z3.BitVecVal(0, 32))
         case ida_hexrays.m_xdu | ida_hexrays.m_xds:
             # Extend or keep the same width; in our simplified model we just forward.
             return left

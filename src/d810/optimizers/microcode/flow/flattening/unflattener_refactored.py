@@ -58,8 +58,10 @@ class UnflattenerRule:
         >>> changes = rule.apply(context, entry_block)
     """
 
-    name = "ControlFlowUnflattener"
-    description = "Removes O-LLVM style control-flow flattening obfuscation"
+    #: Internal coordinator. Not a :class:`FlowOptimizationRule`; never
+    #: displayed in the rule UI. Kept here for debugging and tooling.
+    display_name = "ControlFlowUnflattener"
+    description = "Internal coordinator for O-LLVM control-flow unflattening"
 
     def __init__(
         self,

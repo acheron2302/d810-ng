@@ -295,6 +295,23 @@ class AstNodeZ3Visitor:
             case ida_hexrays.m_sets:
                 is_negative = left < z3.BitVecVal(0, 32)
                 return z3.If(is_negative, z3.BitVecVal(1, 32), z3.BitVecVal(0, 32))
+            case ida_hexrays.m_seto:
+                # Signed overflow flag for `left - right`. Mirrors the
+                # concrete evaluator and `get_sub_of()`:
+                #   res = left - right
+                #   of = ((left ^ res) & (left ^ right)) has sign bit set
+                # Use `left.size()` so this works regardless of whether the
+                # operands are 32-bit or have been narrowed upstream.
+                res = left - right
+                sign_bit = left.size() - 1
+                of_bv = (left ^ res) & (left ^ right)
+                of_bit = typing.cast(
+                    z3.BitVecRef, z3.Extract(sign_bit, sign_bit, of_bv)
+                )
+                of_is_set = of_bit == z3.BitVecVal(1, 1)
+                return z3.If(
+                    of_is_set, z3.BitVecVal(1, 32), z3.BitVecVal(0, 32)
+                )
             case ida_hexrays.m_xdu | ida_hexrays.m_xds:
                 # Extend or keep the same width; in this simplified model we
                 # forward the operand directly.

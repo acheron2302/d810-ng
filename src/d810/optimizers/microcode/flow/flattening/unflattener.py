@@ -13,6 +13,33 @@ from d810.optimizers.microcode.flow.flattening.generic import (
 )
 
 unflat_logger = getLogger("D810.unflat")
+#: Process-wide dedupe set for invalid ``implementation`` values so a
+#: permanently misconfigured ``D810_UNFLATTENER_IMPL`` cannot flood the
+#: log on every property access.  Cleared by tests via
+#: :func:`_reset_invalid_implementation_warn_cache`.
+_INVALID_IMPLEMENTATION_WARNED: set[str] = set()
+
+
+def _warn_invalid_implementation_once(value: str) -> None:
+    """Emit the unknown-implementation WARNING at most once per unique
+    ``value`` per process.
+    """
+    if value in _INVALID_IMPLEMENTATION_WARNED:
+        return
+    _INVALID_IMPLEMENTATION_WARNED.add(value)
+    unflat_logger.warning(
+        "Unflattener: unknown implementation=%r, falling back to 'legacy'",
+        value,
+    )
+
+
+def _reset_invalid_implementation_warn_cache() -> None:
+    """Test helper: clear the dedupe cache so a fresh warning can be
+    observed.  Not for production use.
+    """
+    _INVALID_IMPLEMENTATION_WARNED.clear()
+
+
 FLATTENING_JUMP_OPCODES = [
     ida_hexrays.m_jnz,
     ida_hexrays.m_jz,
@@ -302,6 +329,11 @@ class Unflattener(GenericDispatcherUnflatteningRule):
     IMPLEMENTATION_LEGACY = "legacy"
     IMPLEMENTATION_SERVICES = "services"
 
+    @property
+    def DISPATCHER_COLLECTOR_CLASS(self) -> type[GenericDispatcherCollector]:
+        """Return the class of the dispatcher collector used by this rule."""
+        return OllvmDispatcherCollector
+
     def __init__(self):
         super().__init__()
         # Selected by ``configure()`` from project config or environment.
@@ -315,55 +347,61 @@ class Unflattener(GenericDispatcherUnflatteningRule):
     def selected_implementation(self) -> str:
         """Return the implementation selected for this rule instance.
 
-        Resolved from (in order):
-            1. ``D810_UNFLATTENER_IMPL`` environment variable (test/rollback
-               workflows).
-            2. The ``implementation`` config field.
-            3. ``"legacy"`` default.
+        Resolved through :meth:`select_implementation` so the same
+        normalization (case folding, whitespace trimming, invalid-value
+        fallback) is applied to the environment override and to the
+        project config value.
         """
-        env_value = os.environ.get("D810_UNFLATTENER_IMPL")
-        if env_value:
-            return env_value
-        return self._selected_implementation
+        return self.select_implementation(
+            config_value=self._selected_implementation,
+            env_value=os.environ.get("D810_UNFLATTENER_IMPL"),
+        )
 
     @property
     def services_coordinator(self):
         """Lazily build and return the composition-based coordinator.
 
         Returns ``None`` when the services path is not selected so that
-        legacy rules never pay the import cost.
+        legacy rules never pay the import cost.  When the services path
+        is selected but the coordinator cannot be built (e.g. due to a
+        transient import failure), the failure is logged and the cached
+        coordinator is left as ``None``; the caller will fall back to
+        legacy via :meth:`optimize`.
         """
         if self.selected_implementation != self.IMPLEMENTATION_SERVICES:
             return None
         if self._services_coordinator is None:
-            from d810.optimizers.microcode.flow.flattening.services import (
-                OLLVMDispatcherFinder,
-                PathEmulator,
-            )
-            from d810.optimizers.microcode.flow.flattening.unflattener_refactored import (
-                UnflattenerRule,
-            )
+            try:
+                from d810.optimizers.microcode.flow.flattening.services import (
+                    OLLVMDispatcherFinder,
+                    PathEmulator,
+                )
+                from d810.optimizers.microcode.flow.flattening.unflattener_refactored import (
+                    UnflattenerRule,
+                )
 
-            self._services_coordinator = UnflattenerRule(
-                finder=OLLVMDispatcherFinder(),
-                emulator=PathEmulator(),
-            )
+                self._services_coordinator = UnflattenerRule(
+                    finder=OLLVMDispatcherFinder(),
+                    emulator=PathEmulator(),
+                )
+            except Exception:
+                unflat_logger.exception(
+                    "Unflattener: failed to build services coordinator"
+                )
+                self._services_coordinator = None
         return self._services_coordinator
 
     def configure(self, kwargs):
         super().configure(kwargs)
-        # Resolve and validate the implementation selector. Failures here
-        # are configuration errors: fall back to the legacy path and surface
-        # the misconfiguration in the logs.
-        requested = str(
-            self.config.get("implementation", self.IMPLEMENTATION_LEGACY)
-        ).strip().lower()
-        if requested not in (self.IMPLEMENTATION_LEGACY, self.IMPLEMENTATION_SERVICES):
-            unflat_logger.warning(
-                "Unflattener: unknown implementation=%r, falling back to 'legacy'",
-                requested,
-            )
-            requested = self.IMPLEMENTATION_LEGACY
+        # Resolve and validate the implementation selector through the same
+        # normalization used by the property and the public helper so that
+        # env overrides and config values cannot drift apart.
+        requested = self.select_implementation(
+            config_value=self.config.get(
+                "implementation", self.IMPLEMENTATION_LEGACY
+            ),
+            env_value=None,
+        )
         self._selected_implementation = requested
         if requested == self.IMPLEMENTATION_SERVICES:
             unflat_logger.info(
@@ -384,7 +422,10 @@ class Unflattener(GenericDispatcherUnflatteningRule):
             3. ``"legacy"`` default.
 
         Unknown values fall back to ``"legacy"`` so a misconfigured rule
-        cannot accidentally enable a non-default path.
+        cannot accidentally enable a non-default path.  The
+        per-candidate WARNING fires at most once per unique invalid
+        value per process so a permanent misconfiguration does not
+        flood the log on every block iteration.
 
         Exposed as a static helper so unit tests can exercise the selector
         logic without instantiating the rule (which would require IDA).
@@ -402,34 +443,33 @@ class Unflattener(GenericDispatcherUnflatteningRule):
             if value in valid:
                 return value
             if value:
-                unflat_logger.warning(
-                    "Unflattener: unknown implementation=%r, falling back to 'legacy'",
-                    value,
-                )
+                _warn_invalid_implementation_once(value)
         return Unflattener.IMPLEMENTATION_LEGACY
 
     def optimize(self, blk):
         """Apply the rule, dispatching to the selected implementation.
 
-        Failures inside the services coordinator are surfaced (and recorded
-        in stats) rather than silently falling back to the legacy path on a
-        partially mutated CFG. Configuration errors already fall back to the
-        legacy path during ``configure()``.
+        If services mode is selected but the coordinator could not be
+        built (e.g. import failure), we fall back to the legacy path
+        BEFORE any CFG mutation.  This is a safe pre-mutation fallback
+        because the legacy path is the same dispatcher-detection code
+        that ran before the services opt-in existed.  Failures inside
+        an already-built services coordinator are surfaced (and recorded
+        in stats) rather than silently falling back to the legacy path
+        on a partially mutated CFG.
         """
         if self.selected_implementation == self.IMPLEMENTATION_SERVICES:
-            return self._optimize_with_services(blk)
+            coordinator = self.services_coordinator
+            if coordinator is None:
+                unflat_logger.warning(
+                    "Unflattener: services coordinator unavailable; "
+                    "falling back to legacy before any CFG mutation"
+                )
+                return super().optimize(blk)
+            return self._optimize_with_services(blk, coordinator)
         return super().optimize(blk)
 
-    def _optimize_with_services(self, blk):
-        coordinator = self.services_coordinator
-        if coordinator is None:
-            # Defensive: ``selected_implementation`` should have gated this,
-            # but if the coordinator could not be built for any reason we
-            # fail closed rather than corrupting the CFG.
-            unflat_logger.warning(
-                "Unflattener: services coordinator unavailable; skipping pass"
-            )
-            return 0
+    def _optimize_with_services(self, blk, coordinator):
         from d810.optimizers.core import OptimizationContext
 
         context = OptimizationContext(
