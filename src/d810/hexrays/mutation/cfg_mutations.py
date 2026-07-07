@@ -295,16 +295,38 @@ def change_2way_block_conditional_successor(
     if not verify:
         return True
     try:
-        mba.verify(True)
+        safe_verify(
+            mba,
+            "change_2way_block_conditional_successor",
+            logger_func=helper_logger.error,
+            capture_blocks=[
+                int(blk.serial),
+                int(new_blk_conditional_successor.serial),
+                int(previous_blk_conditional_successor.serial),
+                int(blk.serial) + 1,
+            ],
+            capture_metadata={
+                "operation": "change_2way_block_conditional_successor",
+                "source_block_serial": int(blk.serial),
+                "old_conditional_target": int(previous_blk_conditional_successor_serial),
+                "new_conditional_target": int(blk_successor_serial),
+                "fallthrough_block_serial": int(blk.serial) + 1,
+                "source_succset": [int(s) for s in blk.succset],
+                "old_target_predset": [
+                    int(p) for p in previous_blk_conditional_successor.predset
+                ],
+                "new_target_predset": [
+                    int(p) for p in new_blk_conditional_successor.predset
+                ],
+                "tail_target": int(blk.tail.d.b) if blk.tail is not None else None,
+            },
+        )
 
         return True
-    except RuntimeError as e:
-        helper_logger.error(
-            "Error in change_2way_block_conditional_successor: {0}".format(e)
-        )
-        log_block_info(blk, helper_logger.error)
-        log_block_info(new_blk_conditional_successor, helper_logger.error)
-        raise e
+    except RuntimeError:
+        # safe_verify already logged the diagnostic context and captured
+        # the failure artifact. Preserve the original traceback.
+        raise
 
 
 def update_blk_successor(

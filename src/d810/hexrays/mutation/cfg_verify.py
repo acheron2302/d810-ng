@@ -11,13 +11,18 @@ import json
 import os
 from datetime import datetime, timezone
 
-from d810.core.typing import Any
+from d810.core.typing import Any, Iterable
 import ida_hexrays
 
 from d810.core import getLogger
 from d810.hexrays.utils.hexrays_formatters import block_printer
 
 helper_logger = getLogger(__name__)
+
+# Cap how many diagnostics we dump into logs/artifacts to keep postmortem
+# output bounded when one corruption cascades into many violations.
+_MAX_LOG_DIAGNOSTICS = 20
+_MAX_NEIGHBORHOOD_DUMPS = 10
 
 
 class _InterrCatcher(ida_hexrays.Hexrays_Hooks):
@@ -55,6 +60,126 @@ def log_block_info(blk: ida_hexrays.mblock_t, logger_func=helper_logger.info, ct
     )
 
 
+def _violation_to_dict(v: Any) -> dict[str, Any]:
+    """Convert an ``InvariantViolation`` (or mapping) into a JSON-safe dict."""
+    if isinstance(v, dict):
+        data = dict(v)
+        return _json_safe(data)
+    out: dict[str, Any] = {}
+    code = getattr(v, "code", None)
+    if code is not None:
+        out["code"] = str(code)
+    message = getattr(v, "message", None)
+    if message is not None:
+        out["message"] = str(message)
+    phase = getattr(v, "phase", None)
+    if phase is not None:
+        out["phase"] = str(phase)
+    block_serial = getattr(v, "block_serial", None)
+    if block_serial is not None:
+        out["block_serial"] = int(block_serial)
+    insn_ea = getattr(v, "insn_ea", None)
+    if isinstance(insn_ea, int):
+        out["insn_ea"] = int(insn_ea)
+        out["insn_ea_hex"] = hex(int(insn_ea))
+    details = getattr(v, "details", None)
+    if details is not None:
+        try:
+            out["details"] = _json_safe(dict(details))
+        except Exception:
+            out["details"] = repr(details)
+    return out
+
+
+def collect_cfg_verify_diagnostics(
+    mba: ida_hexrays.mba_t,
+    *,
+    phase: str = "verify_failure",
+    include_insn_checks: bool = False,
+) -> list[dict[str, Any]]:
+    """Run lightweight CFG contract checks and serialize any violations.
+
+    Best-effort: any internal failure produces a single synthetic
+    ``CFG_DIAGNOSTIC_FAILED`` record rather than raising, so that the
+    caller can still re-raise the original ``mba.verify()`` exception.
+    """
+    # Imports are local to avoid pulling CFG contract deps at module import.
+    try:
+        from d810.cfg.contracts.ida_contract import (
+            CfgContractViolationError,
+            IDACfgContract,
+        )
+    except Exception as diag_exc:
+        return [
+            {
+                "code": "CFG_DIAGNOSTIC_FAILED",
+                "message": f"contract import failed: {diag_exc!r}",
+                "phase": phase,
+            }
+        ]
+
+    contract = IDACfgContract()
+    try:
+        contract.verify(
+            mba,
+            plan=None,
+            phase="post",
+            scope="full",
+            include_insn_checks=include_insn_checks,
+        )
+        return []
+    except CfgContractViolationError as exc:
+        return [_violation_to_dict(v) for v in exc.violations]
+    except Exception as diag_exc:
+        return [
+            {
+                "code": "CFG_DIAGNOSTIC_FAILED",
+                "message": repr(diag_exc),
+                "phase": phase,
+            }
+        ]
+
+
+def _diagnostic_block_serials(
+    diagnostics: Iterable[dict[str, Any]],
+    *,
+    qty: int,
+) -> set[int]:
+    """Extract integer block serials in range ``[0, qty)`` from diagnostics."""
+    out: set[int] = set()
+    for d in diagnostics:
+        serial = d.get("block_serial") if isinstance(d, dict) else None
+        if isinstance(serial, int) and 0 <= serial < qty:
+            out.add(serial)
+    return out
+
+
+def log_block_neighborhood(
+    mba: ida_hexrays.mba_t,
+    serial: int,
+    logger_func=helper_logger.error,
+    ctx: str = "",
+) -> None:
+    """Log a block plus its successors, predecessors, prevb/nextb."""
+    with contextlib.suppress(Exception):
+        blk = mba.get_mblock(int(serial))
+        if ctx:
+            logger_func("%s", ctx)
+        log_block_info(blk, logger_func)
+        with contextlib.suppress(Exception):
+            for pred in list(getattr(blk, "predset", []) or []):
+                log_block_info(mba.get_mblock(int(pred)), logger_func)
+        with contextlib.suppress(Exception):
+            for succ in list(getattr(blk, "succset", []) or []):
+                log_block_info(mba.get_mblock(int(succ)), logger_func)
+        with contextlib.suppress(Exception):
+            if getattr(blk, "prevb", None) is not None:
+                log_block_info(blk.prevb, logger_func)
+        with contextlib.suppress(Exception):
+            if getattr(blk, "nextb", None) is not None:
+                log_block_info(blk.nextb, logger_func)
+
+
 def safe_verify(
     mba: ida_hexrays.mba_t,
     ctx: str,
@@ -85,18 +210,90 @@ def safe_verify(
             )
         else:
             logger_func("verify failed after %s: %s", ctx, e, exc_info=True)
+
+        # Best-effort Python CFG diagnostics. Gated by environment variable so
+        # users can opt out; lightweight CFG diagnostics run by default, but
+        # instruction-level checks stay off unless explicitly enabled.
+        include_insn_checks = (
+            str(os.environ.get("D810_VERIFY_DIAG_INSN", "0")).lower()
+            in {"1", "true", "on", "yes"}
+        )
+        diagnostics = collect_cfg_verify_diagnostics(
+            mba,
+            phase="verify_failure",
+            include_insn_checks=include_insn_checks,
+        )
+
+        if diagnostics:
+            shown = diagnostics[:_MAX_LOG_DIAGNOSTICS]
+            logger_func(
+                "Python CFG diagnostics found %d candidate violation(s) for %s",
+                len(diagnostics),
+                ctx,
+            )
+            for d in shown:
+                code = d.get("code", "UNKNOWN")
+                blk = d.get("block_serial")
+                ea = d.get("insn_ea_hex")
+                msg = d.get("message", "")
+                details = d.get("details")
+                logger_func(
+                    "  %s blk=%s ea=%s: %s details=%s",
+                    code,
+                    blk,
+                    ea,
+                    msg,
+                    details,
+                )
+            if len(diagnostics) > _MAX_LOG_DIAGNOSTICS:
+                logger_func(
+                    "  ... %d more diagnostics suppressed from log",
+                    len(diagnostics) - _MAX_LOG_DIAGNOSTICS,
+                )
+
+        qty = int(getattr(mba, "qty", 0))
+        diagnostic_serials = _diagnostic_block_serials(diagnostics, qty=qty)
+
         meta = dict(capture_metadata or {})
         if interr_code is not None:
             meta["interr_code"] = interr_code
             meta["interr_code_hex"] = hex(interr_code)
+        if diagnostics:
+            meta["cfg_diagnostic_violations"] = diagnostics
+        if diagnostic_serials:
+            meta["diagnostic_block_serials"] = sorted(diagnostic_serials)
+
+        combined_capture_blocks = sorted(
+            set(int(b) for b in (capture_blocks or []) if isinstance(b, int))
+            | diagnostic_serials
+        )
+
         capture_failure_artifact(
             mba,
             f"verify failure after {ctx}",
             e,
             logger_func=logger_func,
-            capture_blocks=capture_blocks,
+            capture_blocks=combined_capture_blocks if combined_capture_blocks else None,
             capture_metadata=meta if meta else None,
         )
+
+        # Dump neighborhoods for up to N diagnostic blocks so logs surface
+        # related predecessors/successors rather than only the blocks the
+        # caller happened to focus on.
+        if diagnostic_serials:
+            for serial in sorted(diagnostic_serials)[:_MAX_NEIGHBORHOOD_DUMPS]:
+                log_block_neighborhood(
+                    mba,
+                    serial,
+                    logger_func,
+                    f"--- diagnostic neighborhood blk[{serial}] ---",
+                )
+            if len(diagnostic_serials) > _MAX_NEIGHBORHOOD_DUMPS:
+                logger_func(
+                    "... %d more diagnostic block neighborhoods suppressed",
+                    len(diagnostic_serials) - _MAX_NEIGHBORHOOD_DUMPS,
+                )
+
         # attempt to locate problematic blocks: dump the last two blocks if possible
         with contextlib.suppress(Exception):
             divider = "-" * 14
@@ -282,6 +479,10 @@ __all__ = [
     "capture_failure_artifact",
     "snapshot_block_for_capture",
     "log_block_info",
+    "log_block_neighborhood",
+    "collect_cfg_verify_diagnostics",
+    "_violation_to_dict",
+    "_diagnostic_block_serials",
     "_snapshot_insn",
     "_collect_related_blocks",
     "_json_safe",

@@ -407,3 +407,225 @@ def test_verify_failure_analyzer_contract_matches_capture_artifact(tmp_path, mon
     rendered = json.loads(out)
     assert rendered["count"] == 1
     assert rendered["artifacts"][0]["contract_warnings"] == []
+
+
+# ---------------------------------------------------------------------------
+# Verify-failure diagnostics (plan: verify-diagnostics)
+# ---------------------------------------------------------------------------
+
+
+class _FakeContract:
+    """Minimal stand-in for IDACfgContract used by diagnostic tests."""
+
+    def __init__(self, violations=None, exc=None):
+        self._violations = list(violations or [])
+        self._exc = exc
+        self.calls: list[dict] = []
+
+    def verify(self, mba, plan=None, **kwargs):
+        self.calls.append({"mba": mba, "plan": plan, **kwargs})
+        if self._exc is not None:
+            raise self._exc
+        if self._violations:
+            from d810.cfg.contracts.ida_contract import CfgContractViolationError
+
+            raise CfgContractViolationError(
+                phase=kwargs.get("phase", "post"), violations=self._violations
+            )
+        return ()
+
+
+def _make_violation(code: str, serial: int | None = None, msg: str = "boom"):
+    from d810.cfg.contracts.report import InvariantViolation
+
+    return InvariantViolation(
+        code=code,
+        message=msg,
+        phase="post",
+        block_serial=serial,
+    )
+
+
+def test_collect_cfg_verify_diagnostics_serializes_violations(monkeypatch):
+    """collect_cfg_verify_diagnostics should return dicts with code/block_serial."""
+    from d810.hexrays.mutation import cfg_verify
+
+    mba = _FakeMBA(qty=10)
+    fake = _FakeContract(
+        violations=[
+            _make_violation("CFG_50860_SUCC_MISMATCH", serial=4, msg="mismatch"),
+        ]
+    )
+    # Patch the import target used inside collect_cfg_verify_diagnostics.
+    import d810.cfg.contracts.ida_contract as ida_contract_mod
+
+    monkeypatch.setattr(ida_contract_mod, "IDACfgContract", lambda: fake)
+
+    diagnostics = cfg_verify.collect_cfg_verify_diagnostics(mba)
+    assert len(diagnostics) == 1
+    d = diagnostics[0]
+    assert d["code"] == "CFG_50860_SUCC_MISMATCH"
+    assert d["block_serial"] == 4
+    assert d["message"] == "mismatch"
+    assert fake.calls and fake.calls[0]["scope"] == "full"
+
+
+def test_collect_cfg_verify_diagnostics_handles_internal_failure(monkeypatch):
+    """An exception inside the contract should produce CFG_DIAGNOSTIC_FAILED."""
+    from d810.hexrays.mutation import cfg_verify
+
+    mba = _FakeMBA(qty=4)
+    fake = _FakeContract(exc=RuntimeError("boom"))
+    import d810.cfg.contracts.ida_contract as ida_contract_mod
+
+    monkeypatch.setattr(ida_contract_mod, "IDACfgContract", lambda: fake)
+
+    diagnostics = cfg_verify.collect_cfg_verify_diagnostics(mba)
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["code"] == "CFG_DIAGNOSTIC_FAILED"
+    assert "boom" in diagnostics[0]["message"]
+
+
+def test_safe_verify_runs_python_diagnostics_and_merges_capture_blocks(
+    tmp_path, monkeypatch, caplog
+):
+    """safe_verify should run diagnostics and include diagnostic serials in capture_blocks."""
+    from d810.hexrays.mutation import cfg_verify
+
+    mba = _FakeMBA(qty=8)
+    _FakeBlock(0, mba, succs=[1], preds=[])
+    _FakeBlock(1, mba, succs=[2], preds=[0])
+    _FakeBlock(2, mba, succs=[3], preds=[1])
+    mba.verify_error = RuntimeError("Unknown exception")
+
+    fake = _FakeContract(
+        violations=[_make_violation("CFG_50860_SUCC_MISMATCH", serial=2)]
+    )
+    import d810.cfg.contracts.ida_contract as ida_contract_mod
+
+    monkeypatch.setattr(ida_contract_mod, "IDACfgContract", lambda: fake)
+
+    monkeypatch.setenv("D810_VERIFY_CAPTURE", "1")
+    monkeypatch.setenv("D810_VERIFY_CAPTURE_DIR", str(tmp_path))
+
+    caplog.set_level("ERROR", logger="d810.hexrays.mutation.cfg_verify")
+
+    with pytest.raises(RuntimeError):
+        cfg_verify.safe_verify(
+            mba,
+            "unit-test diagnostic",
+            capture_blocks=[1],
+        )
+
+    artifacts = list(tmp_path.glob("verify_fail_*.json"))
+    assert len(artifacts) == 1
+    payload = json.loads(artifacts[0].read_text(encoding="utf-8"))
+
+    # Diagnostic block serials are included in the captured blocks.
+    captured_serials = {blk["serial"] for blk in payload["captured_blocks"]}
+    assert 2 in captured_serials
+
+    # Violation metadata is present.
+    meta = payload["metadata"]
+    assert "cfg_diagnostic_violations" in meta
+    assert meta["cfg_diagnostic_violations"][0]["code"] == "CFG_50860_SUCC_MISMATCH"
+    assert meta["diagnostic_block_serials"] == [2]
+
+    # Diagnostic summary is logged.
+    assert any("Python CFG diagnostics found" in rec.message for rec in caplog.records)
+    assert any("CFG_50860_SUCC_MISMATCH" in rec.message for rec in caplog.records)
+
+
+def test_safe_verify_emits_cfg_diagnostic_failed_when_collection_breaks(
+    tmp_path, monkeypatch, caplog
+):
+    """Diagnostic collection failure must produce CFG_DIAGNOSTIC_FAILED, not raise."""
+    from d810.hexrays.mutation import cfg_verify
+
+    mba = _FakeMBA(qty=4)
+    _FakeBlock(0, mba, succs=[1], preds=[])
+    _FakeBlock(1, mba, succs=[], preds=[0])
+    mba.verify_error = RuntimeError("Unknown exception")
+
+    fake = _FakeContract(exc=ValueError("contract exploded"))
+    import d810.cfg.contracts.ida_contract as ida_contract_mod
+
+    monkeypatch.setattr(ida_contract_mod, "IDACfgContract", lambda: fake)
+
+    monkeypatch.setenv("D810_VERIFY_CAPTURE", "1")
+    monkeypatch.setenv("D810_VERIFY_CAPTURE_DIR", str(tmp_path))
+
+    caplog.set_level("ERROR", logger="d810.hexrays.mutation.cfg_verify")
+
+    with pytest.raises(RuntimeError):
+        cfg_verify.safe_verify(mba, "unit-test diagnostic failure")
+
+    artifacts = list(tmp_path.glob("verify_fail_*.json"))
+    assert len(artifacts) == 1
+    payload = json.loads(artifacts[0].read_text(encoding="utf-8"))
+    meta = payload["metadata"]
+    assert meta["cfg_diagnostic_violations"][0]["code"] == "CFG_DIAGNOSTIC_FAILED"
+
+
+def test_change_2way_block_conditional_successor_uses_safe_verify(monkeypatch):
+    """The 2-way mutation helper should delegate verification to safe_verify."""
+    from d810.hexrays import cfg_utils
+    from d810.hexrays.mutation import cfg_mutations
+    from d810.hexrays.mutation import cfg_verify
+
+    # The helper does `blk.tail.d = ida_hexrays.mop_t()` then make_blkref.
+    # Replace mop_t in cfg_mutations' ida_hexrays module with a fake that
+    # returns an object exposing make_blkref.
+    class _FakeMop:
+        def __init__(self):
+            self.b: int | None = None
+
+        def make_blkref(self, b: int) -> None:
+            self.b = int(b)
+
+        def erase(self) -> None:
+            self.b = None
+
+    fake_mop_t = _FakeMop
+    # cfg_mutations does `import ida_hexrays`; patch the symbol it uses.
+    monkeypatch.setattr(cfg_mutations.ida_hexrays, "mop_t", fake_mop_t)
+    # Also patch the original module in case cfg_mutations re-reads it.
+    monkeypatch.setattr(cfg_verify.ida_hexrays, "mop_t", fake_mop_t)
+
+    mba = _FakeMBA(qty=12)
+    # tail.d must expose .b for the existing helper's first read of
+    # previous_blk_conditional_successor_serial.
+    tail = SimpleNamespace(
+        ea=0x4000,
+        opcode=0x99,
+        l=SimpleNamespace(t=0, b=7),
+        d=SimpleNamespace(b=7),
+    )
+    blk = _FakeBlock(5, mba, succs=[7, 8], preds=[3], tail=tail)
+    _FakeBlock(7, mba, succs=[], preds=[5])
+    _FakeBlock(8, mba, succs=[], preds=[5])
+    _FakeBlock(3, mba, succs=[5], preds=[])
+    _FakeBlock(9, mba, succs=[], preds=[])
+
+    captured = {}
+
+    def _fake_safe_verify(mba_arg, ctx, **kwargs):
+        captured["ctx"] = ctx
+        captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(cfg_mutations, "safe_verify", _fake_safe_verify)
+    monkeypatch.setattr(cfg_verify, "safe_verify", _fake_safe_verify)
+
+    # The helper should call safe_verify even though the underlying verify
+    # would normally pass.
+    result = cfg_mutations.change_2way_block_conditional_successor(
+        blk, 9, verify=True
+    )
+    assert result is True
+    assert captured["ctx"] == "change_2way_block_conditional_successor"
+    meta = captured["kwargs"]["capture_metadata"]
+    assert meta["operation"] == "change_2way_block_conditional_successor"
+    assert meta["source_block_serial"] == 5
+    assert meta["old_conditional_target"] == 7
+    assert meta["new_conditional_target"] == 9
+    assert 5 in captured["kwargs"]["capture_blocks"]
