@@ -30,6 +30,8 @@ dev = [
 [project.scripts]
 install-speedups = "d810.speedups.install:main"
 install-d810-plugin = "d810.install_plugin:main"
+d810-ida-domain-check = "d810.testing.ida_domain_check:main"
+d810-ida-domain-run = "d810.testing.ida_domain_launcher:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

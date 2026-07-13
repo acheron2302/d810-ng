@@ -79,6 +79,21 @@ class ProjectManager:
             self.config["configurations"] = cfg_list
             self.config.save()
 
+    def register_transient(self, project: ProjectConfiguration) -> None:
+        """Register a project in-memory only (no config persistence).
+
+        Unlike :meth:`add`, this method does **not** mutate ``options.json``
+        or the user's configuration directory. It is intended for short-lived
+        contexts such as CLI smoke checks that need to evaluate a config file
+        passed via the command line without leaving state behind.
+
+        Args:
+            project: Project configuration to register under ``project.path.name``.
+        """
+        name = project.path.name
+        with self._lock:
+            self._projects[name] = project
+
     @functools.singledispatchmethod
     def update(self, old_name: str, new_project: ProjectConfiguration) -> None:
         with self._lock:
