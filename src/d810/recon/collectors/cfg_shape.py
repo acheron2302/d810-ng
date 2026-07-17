@@ -21,6 +21,11 @@ _MMAT_PREOPTIMIZED = 5
 # Threshold above which a block's in-degree is flagged as a dispatcher candidate.
 _HIGH_INDEGREE_THRESHOLD = 3
 
+# Above this many reachable blocks, the iterative dominator pass becomes
+# expensive on dense CFGs.  We fall back to a cheap approximation rather
+# than running set-iteration-heavy BFS+intersect loops for huge functions.
+_MAX_DOMINATOR_SCORE_BLOCKS = 400
+
 
 def _collect_from_portable_cfg(target) -> tuple[set[int], dict[int, tuple[int, ...]], dict[int, set[int]]]:
     """Extract nodes/succs/preds from a FlowGraph snapshot."""
@@ -164,13 +169,28 @@ class CFGShapeCollector:
         block_count = len(nodes)
         edge_count = sum(len(s) for s in succs.values())
         max_in_degree = max((len(p) for p in preds.values()), default=0)
-        score = _flattening_score(entry, nodes, succs, preds)
+
+        # Cheap gates before the iterative dominator pass:
+        #   * No dispatcher candidate and low max in-degree → skip exact
+        #     score (set iteration would only return 0).
+        #   * Very large graph → fall back to a cheap approximation to
+        #     avoid O(N^2) intersect loops on dense CFGs.
+        flattening_approx = 0
+        score: float
+        if max_in_degree < _HIGH_INDEGREE_THRESHOLD:
+            score = 0.0
+        elif block_count > _MAX_DOMINATOR_SCORE_BLOCKS:
+            score = min(1.0, float(max_in_degree) / max(1.0, float(block_count)))
+            flattening_approx = 1
+        else:
+            score = _flattening_score(entry, nodes, succs, preds)
 
         metrics = MappingProxyType({
             "block_count": block_count,
             "edge_count": edge_count,
             "max_in_degree": max_in_degree,
             "flattening_score": score,
+            "flattening_score_approx": flattening_approx,
         })
 
         candidates: list[CandidateFlag] = []

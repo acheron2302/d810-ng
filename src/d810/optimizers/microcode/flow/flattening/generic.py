@@ -184,6 +184,58 @@ class UnflatteningEvent:
 
 unflat_logger = getLogger("D810.unflat")
 
+# Phase 0: Lightweight profiling counters/logging. Opt-in via env var
+# D810_UNFLAT_PROFILE=1 to avoid overhead/log noise in normal operation.
+import os as _os
+_UNFLAT_PROFILE = _os.environ.get("D810_UNFLAT_PROFILE", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+
+def _maybe_log_profile(message: str, payload: dict) -> None:
+    """Emit a single line of profiling data when profiling is enabled."""
+    if not _UNFLAT_PROFILE:
+        return
+    try:
+        # Format values without any mop/instruction formatting (cheap).
+        parts = ", ".join(f"{k}={v!r}" for k, v in payload.items())
+        unflat_logger.info("UNFLAT_PROFILE %s: %s", message, parts)
+    except Exception:
+        # Profiling must never raise.
+        pass
+
+
+def _compute_use_before_def_hash(use_before_def_mops) -> int | None:
+    """Compute a stable structural hash for a mop list.
+
+    Returns None if any mop cannot be hashed safely (e.g. invalid SWIG
+    object) so the caller can fall back to a non-cached path.
+    """
+    try:
+        # Cache func_ea is not relevant for op-level hashes; pass 0.
+        return hash(
+            tuple(
+                sorted(
+                    (int(mop.t), int(_safe_hash_mop(mop)))
+                    for mop in use_before_def_mops
+                )
+            )
+        )
+    except Exception:
+        return None
+
+
+def _safe_hash_mop(mop) -> int:
+    """Compute a hash of a mop, falling back to a sentinel for invalid mops."""
+    from d810.hexrays.utils.hexrays_helpers import structural_mop_hash
+    try:
+        return int(structural_mop_hash(mop, 0))
+    except Exception:
+        return id(mop)
+
 
 class GenericDispatcherBlockInfo(object):
 
@@ -288,6 +340,14 @@ class GenericDispatcherInfo(object):
         self.comparison_values = []
         self.dispatcher_internal_blocks = []
         self.dispatcher_exit_blocks = []
+        # Phase 4: set-shaped mirrors of the above lists to enable O(1)
+        # membership and O(min) intersection.  Both are kept in sync
+        # with the lists at construction/reset and whenever blocks are
+        # added/removed.  These are the canonical source of truth for
+        # set-membership operations; the lists are kept for ordered
+        # iteration/serialization compatibility.
+        self.dispatcher_internal_block_serials: set[int] = set()
+        self.dispatcher_exit_block_serials: set[int] = set()
 
         # Used for o-llvm unflattening
         self.outmost_dispatch_num = self.guess_outmost_dispatcher_blk()
@@ -305,6 +365,33 @@ class GenericDispatcherInfo(object):
         self.comparison_values = []
         self.dispatcher_internal_blocks = []
         self.dispatcher_exit_blocks = []
+        self.dispatcher_internal_block_serials = set()
+        self.dispatcher_exit_block_serials = set()
+
+    def _ensure_block_serial_sets(self) -> None:
+        """Rebuild the internal/exit serial sets from the list mirrors.
+
+        Phase 4: subclasses append directly to
+        ``dispatcher_internal_blocks`` / ``dispatcher_exit_blocks``
+        during exploration, so we lazily rebuild the parallel sets
+        on demand.  This avoids the need to change every call site
+        while still giving us O(1) membership/intersection in the
+        hot paths (should_emulation_continue, get_shared_internal_blocks).
+        """
+        self.dispatcher_internal_block_serials = {
+            int(blk_info.serial) for blk_info in self.dispatcher_internal_blocks
+        }
+        self.dispatcher_exit_block_serials = {
+            int(blk_info.serial) for blk_info in self.dispatcher_exit_blocks
+        }
+        # Phase 1: per-pass cache for state->target resolution. Maps
+        # (state_value_tuple, resolve_conditional_exits) -> target_blk.
+        # Holds mblock_t references that are only safe to reuse as long
+        # as the CFG/MBA has not been mutated during the pass.  The
+        # owning unflattening rule clears caches around any mutation
+        # boundary (see _clear_unflattening_analysis_caches).
+        self._state_target_cache: dict[tuple, "ida_hexrays.mblock_t | None"] = {}
+        self._state_target_jtbl_map: dict[int, int] = {}
 
     def explore(self, blk: ida_hexrays.mblock_t) -> bool:
         return False
@@ -312,18 +399,21 @@ class GenericDispatcherInfo(object):
     def get_shared_internal_blocks(
         self, other_dispatcher: GenericDispatcherInfo
     ) -> list[ida_hexrays.mblock_t]:
-        my_dispatcher_block_serial = [
-            blk_info.serial for blk_info in self.dispatcher_internal_blocks
-        ]
-        other_dispatcher_block_serial = [
-            blk_info.serial
-            for blk_info in other_dispatcher.dispatcher_internal_blocks
-        ]
-        return [
-            self.mba.get_mblock(blk_serial)
-            for blk_serial in my_dispatcher_block_serial
-            if blk_serial in other_dispatcher_block_serial
-        ]
+        # Phase 4: O(min(|self|, |other|)) set intersection instead
+        # of the previous O(n*m) list scan.  The sets are rebuilt
+        # lazily to stay in sync with list-based subclass populating.
+        self._ensure_block_serial_sets()
+        other_dispatcher._ensure_block_serial_sets()
+        shared_serials = (
+            self.dispatcher_internal_block_serials
+            & other_dispatcher.dispatcher_internal_block_serials
+        )
+        result: list[ida_hexrays.mblock_t] = []
+        for blk_serial in shared_serials:
+            blk = self.mba.get_mblock(int(blk_serial))
+            if blk is not None:
+                result.append(blk)
+        return result
 
     def is_sub_dispatcher(self, other_dispatcher: GenericDispatcherInfo) -> bool:
         shared_blocks = self.get_shared_internal_blocks(other_dispatcher)
@@ -334,12 +424,14 @@ class GenericDispatcherInfo(object):
         return False
 
     def should_emulation_continue(self, cur_blk: ida_hexrays.mblock_t) -> bool:
-        exit_block_serial_list = [
-            exit_block.serial for exit_block in self.dispatcher_exit_blocks
-        ]
-        if (cur_blk is not None) and (cur_blk.serial not in exit_block_serial_list):
-            return True
-        return False
+        # Phase 4: O(1) set membership instead of O(n) list scan on
+        # every emulation step.  Set is rebuilt lazily to stay in sync
+        # with list-based subclass populating.
+        if cur_blk is None:
+            return False
+        if not self.dispatcher_exit_block_serials:
+            self._ensure_block_serial_sets()
+        return int(cur_blk.serial) not in self.dispatcher_exit_block_serials
 
     def emulate_dispatcher_with_father_history(
         self,
@@ -347,6 +439,70 @@ class GenericDispatcherInfo(object):
         resolve_conditional_exits: bool = False,
         max_emulated_instructions: int = 10000,
     ) -> tuple[ida_hexrays.mblock_t, list[ida_hexrays.minsn_t]]:
+        # Phase 0/1: profiling + state-target cache.
+        # We track emulations and check the cache *before* any expensive
+        # constant-value extraction so that repeated state values during a
+        # single analyze pass skip the interpreter entirely.
+        profile_counters = getattr(self, "_profile_counters_holder", None)
+        if profile_counters is not None:
+            profile_counters["dispatcher_emulations"] += 1
+        # Pre-compute the state value tuple used as a cache key.  The
+        # cache is per-GenericDispatcherInfo (per-dispatcher) and is
+        # cleared by the owning unflattening rule around mutation
+        # boundaries.
+        cache = getattr(self, "_state_target_cache", None)
+        try:
+            state_values: list[int] = []
+            for initialization_mop in self.entry_block.use_before_def_list:
+                v = father_history.get_mop_constant_value(initialization_mop)
+                if v is None:
+                    state_values = []
+                    break
+                state_values.append(int(v))
+        except Exception:
+            state_values = []
+
+        cache_key = None
+        if cache is not None and state_values:
+            cache_key = (tuple(state_values), bool(resolve_conditional_exits))
+            cached_target = cache.get(cache_key)
+            if cached_target is not None or (
+                cache_key in cache and cached_target is None
+            ):
+                if profile_counters is not None:
+                    profile_counters["dispatcher_state_cache_hits"] = (
+                        profile_counters.get("dispatcher_state_cache_hits", 0) + 1
+                    )
+                return cached_target, []
+
+        # Phase 1: jtbl direct-map short-circuit.  If the dispatcher
+        # entry ends in m_jtbl and the (state_value -> target_serial)
+        # map is unambiguous for every state variable, we can return
+        # the target block without running the MicroCodeInterpreter.
+        jtbl_map = getattr(self, "_state_target_jtbl_map", None)
+        if (
+            jtbl_map
+            and state_values
+            and len(state_values) == 1
+            and not resolve_conditional_exits
+        ):
+            jtbl_serial = jtbl_map.get(int(state_values[0]))
+            if jtbl_serial is not None:
+                target_blk = self.mba.get_mblock(int(jtbl_serial))
+                if target_blk is not None:
+                    if profile_counters is not None:
+                        profile_counters["jtbl_map_hits"] = (
+                            profile_counters.get("jtbl_map_hits", 0) + 1
+                        )
+                    if cache is not None:
+                        cache[cache_key] = target_blk
+                    return target_blk, []
+            else:
+                if profile_counters is not None:
+                    profile_counters["jtbl_map_fallbacks"] = (
+                        profile_counters.get("jtbl_map_fallbacks", 0) + 1
+                    )
+
         # Use concrete values from tracker - do NOT use symbolic mode here
         # Symbolic mode would generate fake values instead of using tracked values
         microcode_interpreter = MicroCodeInterpreter(symbolic_mode=False)
@@ -429,6 +585,10 @@ class GenericDispatcherInfo(object):
             cur_ins = microcode_environment.next_ins
         # We return the first block executed which is not part of the dispatcher
         # and all instructions which have been executed by the dispatcher
+        # Phase 1: cache the resolved target for future state-value repeats
+        # within the same analyze pass.
+        if cache is not None and cache_key is not None:
+            cache[cache_key] = cur_blk
         return cur_blk, instructions_executed
 
     def print_info(self, verbose=False):
@@ -488,7 +648,9 @@ class GenericDispatcherCollector(ida_hexrays.minsn_visitor_t):
     def __init__(self):
         super().__init__()
         self.dispatcher_list = []
-        self.explored_blk_serials = []
+        # Phase 4: explored_blk_serials is now a set for O(1) membership
+        # testing in the visitor hot path.
+        self.explored_blk_serials: set[int] = set()
         self.dispatcher_min_internal_block = self.DEFAULT_DISPATCHER_MIN_INTERNAL_BLOCK
         self.dispatcher_min_exit_block = self.DEFAULT_DISPATCHER_MIN_EXIT_BLOCK
         self.dispatcher_min_comparison_value = (
@@ -527,7 +689,7 @@ class GenericDispatcherCollector(ida_hexrays.minsn_visitor_t):
     def visit_minsn(self):
         if self.blk.serial in self.explored_blk_serials:
             return 0
-        self.explored_blk_serials.append(self.blk.serial)
+        self.explored_blk_serials.add(self.blk.serial)
         disp_info = self.DISPATCHER_CLASS(self.blk.mba)
         # Pass entropy thresholds if available
         kwargs = {}
@@ -557,7 +719,7 @@ class GenericDispatcherCollector(ida_hexrays.minsn_visitor_t):
 
     def reset(self):
         self.dispatcher_list = []
-        self.explored_blk_serials = []
+        self.explored_blk_serials = set()
 
     def get_dispatcher_list(self) -> list[GenericDispatcherInfo]:
         self.remove_sub_dispatchers()
@@ -980,6 +1142,32 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
         self._last_maturity: int = -1
         # Last collected dispatcher layout signals (for debug tooling/tests).
         self._last_layout_signals: dict[str, Any] = {}
+        # Phase 0: per-pass profiling counters (only meaningful when
+        # D810_UNFLAT_PROFILE=1 is set in the environment). We always
+        # allocate the dict but keep accumulation cheap.
+        self._profile_counters: dict[str, int] = {
+            "dispatchers_found": 0,
+            "dispatcher_fathers_processed": 0,
+            "father_histories_calls": 0,
+            "father_histories_cache_hits": 0,
+            "search_backward_calls": 0,
+            "dispatcher_emulations": 0,
+            "abc_resolve_cache_hits": 0,
+            "abc_resolve_cache_misses": 0,
+            "jtbl_map_hits": 0,
+            "jtbl_map_fallbacks": 0,
+        }
+        self._profile_timings: dict[str, float] = {}
+        # Phase 1: per-pass cache for state->target resolution.
+        # Maps (dispatcher_entry_serial, state_value, resolve_conditional_exits)
+        # -> target_mblock_t.  Populated as we emulate and reused for
+        # repeated state values.  Cleared whenever the underlying
+        # dispatcher or MBA structure changes.
+        self._dispatcher_state_cache: dict[tuple[int, int, bool], "ida_hexrays.mblock_t"] = {}
+        # Phase 2: per-pass cache for get_dispatcher_father_histories().
+        # Maps (entry_serial, father_serial, use_before_def_hash) ->
+        # list[MopHistory].  Cleared around any CFG mutation.
+        self._father_history_cache: dict[tuple[int, int, int], list] = {}
 
     @property
     @abc.abstractmethod
@@ -1361,6 +1549,28 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
         self.dispatcher_list = [
             x for x in self.dispatcher_collector.get_dispatcher_list()
         ]
+        # Phase 0/1: wire profile counters and pre-build jtbl direct
+        # maps once per pass so per-state emulate calls can short-circuit.
+        for dispatcher_info in self.dispatcher_list:
+            dispatcher_info._profile_counters_holder = self._profile_counters
+            # Reset/initialize the per-dispatcher state target cache.
+            dispatcher_info._state_target_cache = {}
+            try:
+                from d810.optimizers.microcode.flow.flattening.abc_block_splitter import (
+                    _build_jtbl_case_target_map,
+                )
+                dispatcher_info._state_target_jtbl_map = _build_jtbl_case_target_map(
+                    dispatcher_info, self.mba
+                )
+            except Exception:
+                dispatcher_info._state_target_jtbl_map = {}
+        self._profile_counters["dispatchers_found"] = len(self.dispatcher_list)
+        # Also tag internal blocks with the dispatcher jtbl map for the
+        # abc_block_splitter to reuse if it asks.
+        for dispatcher_info in self.dispatcher_list:
+            jtbl_map = getattr(dispatcher_info, "_state_target_jtbl_map", None)
+            if not jtbl_map:
+                continue
 
     def ensure_all_dispatcher_fathers_are_direct(self) -> int:
         nb_change = 0
@@ -1414,6 +1624,32 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
         dispatcher_entry_block: GenericDispatcherBlockInfo,
         dispatcher_info: GenericDispatcherInfo,
     ) -> list[MopHistory]:
+        # Phase 0: profiling counter.
+        self._profile_counters["father_histories_calls"] += 1
+        # Phase 2: per-pass cache keyed by (dispatcher_entry_serial,
+        # dispatcher_father_serial, structural hash of use_before_def mops).
+        # The cache stores MopHistory objects which carry borrowed SWIG
+        # references (mblock_t in BlockInfo, mop_t in searched_mop_list).
+        # Such references are only safe to reuse as long as the MBA/CFG
+        # has not been mutated.  _clear_unflattening_analysis_caches()
+        # is called around every mutation boundary so a cache hit only
+        # ever returns histories that are still valid for the current
+        # analyze-only phase.
+        cache = getattr(self, "_father_history_cache", None)
+        entry_serial = int(dispatcher_entry_block.serial)
+        father_serial = int(dispatcher_father.serial)
+        mop_hash_key = _compute_use_before_def_hash(
+            dispatcher_entry_block.use_before_def_list
+        )
+        cache_key = None
+        if cache is not None and mop_hash_key is not None:
+            cache_key = (entry_serial, father_serial, mop_hash_key)
+            cached = cache.get(cache_key)
+            if cached is not None:
+                self._profile_counters["father_histories_cache_hits"] = (
+                    self._profile_counters.get("father_histories_cache_hits", 0) + 1
+                )
+                return list(cached)
         father_tracker = MopTracker(
             dispatcher_entry_block.use_before_def_list,
             max_nb_block=self.MOP_TRACKER_MAX_NB_BLOCK,
@@ -1429,7 +1665,20 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
             dispatcher_father.serial,
             father_histories,
         )
+        if cache is not None and cache_key is not None:
+            cache[cache_key] = list(father_histories)
         return father_histories
+
+    def _clear_unflattening_analysis_caches(self, reason: str) -> None:
+        """Clear per-pass caches that may hold stale references.
+
+        Phase 2: any CFG/microcode mutation invalidates the caches that
+        hold MopHistory references.  Callers must invoke this helper
+        around every mutation boundary.
+        """
+        self._father_history_cache = {}
+        self._dispatcher_state_cache = {}
+        _maybe_log_profile("clear_caches", {"reason": reason})
 
     def check_if_histories_are_resolved(self, mop_histories: list[MopHistory]) -> bool:
         return all([mop_history.is_resolved() for mop_history in mop_histories])
@@ -1511,6 +1760,11 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
             nb_duplication,
             nb_change,
         )
+        # Phase 2: duplicate_histories() can create new blocks, which
+        # invalidates the father history cache.  Clear it to prevent
+        # stale MopHistory references being reused.
+        if nb_duplication > 0 or nb_change > 0:
+            self._clear_unflattening_analysis_caches("duplicate_histories")
         return 0
 
     # =========================================================================
@@ -1937,6 +2191,25 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
     def _serial_in_set(serial_set, serial: int) -> bool:
         for cur in serial_set:
             if int(cur) == int(serial):
+                return True
+        return False
+
+    def _has_jtbl_dispatcher_in_last_pass(self) -> bool:
+        """Return True if any dispatcher processed in the last pass had a
+        jtbl tail instruction.
+
+        Phase 5: used to gate the expensive ``_has_cross_case_hazard``
+        scan.  Cross-case hazards only arise from jtbl-based dispatchers
+        so non-jtbl dispatchers can skip the full-MBA scan.
+        """
+        for dispatcher_info in self.dispatcher_list:
+            entry_block = dispatcher_info.entry_block
+            if entry_block is None:
+                continue
+            blk = getattr(entry_block, "blk", None)
+            if blk is None or blk.tail is None:
+                continue
+            if blk.tail.opcode == ida_hexrays.m_jtbl:
                 return True
         return False
 
@@ -2742,6 +3015,11 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
                 father_history=father_history,
             )
 
+        # Phase 2: any successful ABC pattern rewrite modifies the CFG,
+        # so per-pass caches (which may hold stale MopHistory refs) must
+        # be cleared to avoid using them on subsequent fathers.
+        if total_n > 0:
+            self._clear_unflattening_analysis_caches("fix_fathers_from_mop_history")
         return total_n
 
     def find_bad_while_loops(self, blk):
@@ -3031,11 +3309,18 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
                 return total_nb_change
 
         # Scan for residual single-iteration loops and record for cleanup
-        loops_found = self.scan_for_single_iteration_loops()
-        if loops_found > 0:
-            unflat_logger.info(
-                "Found %d provable single-iteration loops after unflattening", loops_found
-            )
+        # Phase 5: only run the (full-MBA) scan when unflattening actually
+        # produced changes this pass.  No changes means no new state
+        # transitions were introduced, so a full scan would be pure
+        # overhead.
+        if self.last_pass_nb_patch_done > 0:
+            loops_found = self.scan_for_single_iteration_loops()
+            if loops_found > 0:
+                unflat_logger.info(
+                    "Found %d provable single-iteration loops after unflattening", loops_found
+                )
+        else:
+            loops_found = 0
 
         # Post-apply instruction sweep (const prop, peephole, etc.)
         self._post_apply_instruction_sweep()
@@ -3154,6 +3439,14 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
         if not self.check_if_rule_should_be_used(blk):
             return 0
 
+        # Phase 0/2: per-pass caches must be cleared at the start of
+        # every optimize() call because the previous pass may have
+        # mutated the CFG.  Counters are also reset.
+        for key in self._profile_counters:
+            self._profile_counters[key] = 0
+        self._father_history_cache = {}
+        self._dispatcher_state_cache = {}
+
         self._optimize_deadline = _time.monotonic() + self.MAX_OPTIMIZE_SECONDS
 
         # Apply any modifications scheduled for this maturity level
@@ -3250,7 +3543,11 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
         )
         # self.dispatcher_fixer_abc(self.dispatcher_list)
         for dispatcher_info in self.dispatcher_list:
-            dispatcher_info.print_info()
+            # Phase 5: gate the verbose print_info() behind debug-on or
+            # the profiling flag -- otherwise it formats every mop and
+            # instruction in the dispatcher even when nobody is reading.
+            if unflat_logger.debug_on or _UNFLAT_PROFILE:
+                dispatcher_info.print_info()
             dispatcher_father_list = [
                 self.mba.get_mblock(x)
                 for x in dispatcher_info.entry_block.blk.predset
@@ -3322,7 +3619,20 @@ class GenericDispatcherUnflatteningRule(GenericUnflatteningRule):
             logger_func=unflat_logger.error,
         )
         # Safety: detect cross-case topology that crashes IDA's structurer
-        if not self._verify_failed and self._has_cross_case_hazard():
+        # Phase 5: only run the (full-MBA) cross-case hazard scan when a
+        # jtbl dispatcher was processed in this pass OR when deferred
+        # case-overlap edges were recorded.  In other passes the full scan
+        # is pure overhead and may flag pre-existing topologies that were
+        # already validated at a previous maturity.
+        if (
+            not self._verify_failed
+            and self.last_pass_nb_patch_done > 0
+            and (
+                bool(self._deferred_case_overlap_edges)
+                or self._has_jtbl_dispatcher_in_last_pass()
+            )
+            and self._has_cross_case_hazard()
+        ):
             self._verify_failed = True
             if self.last_pass_nb_patch_done > 0:
                 # Patches were applied this pass -- IDA needs a non-zero return

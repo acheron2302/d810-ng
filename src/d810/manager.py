@@ -740,14 +740,21 @@ class D810Manager:
         return pipeline
 
     def _build_recon_phase(self) -> "ReconPhase | None":
-        """Construct a ReconPhase with all flow-recovery collectors.
+        """Construct a ReconPhase with the configured set of flow-recovery collectors.
 
         Only called when config["enable_recon_pipeline"] is True (the default).
         Imports are guarded at module level - if the recon package is unavailable
         this returns None and the plugin loads normally.
 
+        Optional config keys (Phase 7):
+            * ``recon_collector_tier``: ``"minimal"``, ``"normal"``, ``"full"``
+              (or any other value to treat as full). Default ``"full"``.
+            * ``recon_collectors``: explicit list of collector names to register.
+              When provided, overrides ``recon_collector_tier``.
+
         Returns:
-            ReconPhase instance with all collectors registered, or None on failure.
+            ReconPhase instance with the requested collectors registered, or
+            ``None`` on failure.
         """
         try:
             db_path = (self.log_dir / "d810_recon.db") if self.log_dir else None
@@ -755,19 +762,58 @@ class D810Manager:
                 db_path = pathlib.Path(tempfile.gettempdir()) / "d810_recon.db"
             store = ReconStore(db_path)
             phase = ReconPhase(store=store)
-            phase.register(CFGShapeCollector())
-            phase.register(OpcodeDistributionCollector())
-            phase.register(DispatchPatternCollector())
-            phase.register(HandlerTransitionsCollector())
-            phase.register(ReturnFrontierCollector())
-            phase.register(CtreeStructureCollector())
-            phase.register(CompareChainCollector())
-            phase.register(FlowProfileClassifierCollector())
-            phase.register(FixPredSignalsCollector())
+
+            full_set = [
+                CFGShapeCollector(),
+                OpcodeDistributionCollector(),
+                DispatchPatternCollector(),
+                HandlerTransitionsCollector(),
+                ReturnFrontierCollector(),
+                CtreeStructureCollector(),
+                CompareChainCollector(),
+                FlowProfileClassifierCollector(),
+                FixPredSignalsCollector(),
+            ]
+            minimal_set = [
+                CFGShapeCollector(),
+                DispatchPatternCollector(),
+            ]
+
+            all_by_name = {c.name: c for c in full_set}
+            explicit = self.config.get("recon_collectors")
+            tier = str(self.config.get("recon_collector_tier", "full")).lower()
+
+            if explicit is not None:
+                if not isinstance(explicit, (list, tuple)):
+                    logger.warning(
+                        "recon_collectors config must be a list of collector "
+                        "names; ignoring. Got %r", type(explicit).__name__,
+                    )
+                    chosen = full_set
+                else:
+                    chosen = []
+                    for name in explicit:
+                        collector = all_by_name.get(str(name))
+                        if collector is None:
+                            logger.warning(
+                                "Unknown recon collector name in config: %r",
+                                name,
+                            )
+                            continue
+                        chosen.append(collector)
+            elif tier == "minimal":
+                chosen = minimal_set
+            elif tier == "normal":
+                chosen = full_set
+            else:
+                # Treat anything else (including "full") as full for safe default.
+                chosen = full_set
+
+            for collector in chosen:
+                phase.register(collector)
             logger.info(
-                "ReconPhase enabled: %d collectors, db=%s",
-                phase.collector_count,
-                db_path,
+                "ReconPhase enabled: %d collectors (tier=%s, db=%s)",
+                phase.collector_count, tier, db_path,
             )
             return phase
         except Exception as exc:

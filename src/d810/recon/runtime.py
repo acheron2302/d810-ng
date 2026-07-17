@@ -21,7 +21,7 @@ from d810.core.logging import getLogger
 from d810.core.typing import TYPE_CHECKING, Any
 
 from d810.recon.analysis import AnalysisPhase
-from d810.recon.models import DeobfuscationHints
+from d810.recon.models import DeobfuscationHints, ReconResult
 from d810.recon.outcome import (
     ConsumerOutcomeReport,
     FlowGateOutcomeAdapter,
@@ -38,6 +38,12 @@ if TYPE_CHECKING:
     from d810.recon.flow_hints import FlowContextHintSummary
 
 logger = getLogger("D810.recon.runtime")
+
+# Lightweight opt-in profiling via env var or instance flag. Keep disabled
+# overhead near zero when the module flag is false.
+import os
+
+_RECON_PROFILE_ENV = "D810_RECON_PROFILE"
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +91,51 @@ class ReconAnalysisRuntime:
         self._store = store
         self._current_func_ea: int = -1
         self._outcome_log: ReconOutcomeLog = ReconOutcomeLog()
+        # ---- in-memory caches (per decompilation, cleared by reset_for_func) ----
+        # Fresh collector results waiting to be analyzed/persisted.
+        self._results_by_func: dict[int, list[ReconResult]] = {}
+        # Functions whose in-memory state is newer than the on-disk store.
+        self._dirty_funcs: set[int] = set()
+        # Last analyzed hints keyed by func_ea to skip repeat work.
+        self._hints_cache_by_func: dict[int, DeobfuscationHints] = {}
+        # Collector names that fired per function (independent of whether
+        # their rows were persisted, to support session-summary accuracy
+        # even when empty rows are skipped).
+        self._collector_counts_by_func: dict[int, set[str]] = {}
+        # Read-only profiling counters. Enable via env D810_RECON_PROFILE=1.
+        self._profile_enabled: bool = bool(os.environ.get(_RECON_PROFILE_ENV))
+        self._profile_counters: dict[str, int] = {
+            "ingest_results_calls": 0,
+            "results_ingested": 0,
+            "empty_results_skipped": 0,
+            "analyze_dirty_calls": 0,
+            "analyze_dirty_cache_hits": 0,
+            "analyze_dirty_persisted": 0,
+            "analyze_and_persist_calls": 0,
+            "analyze_and_persist_store_loads": 0,
+            "load_all_recon_results_calls": 0,
+        }
+
+    # ------------------------------------------------------------------
+    # Profiling
+    # ------------------------------------------------------------------
+
+    def enable_profiling(self, enabled: bool = True) -> None:
+        """Enable or disable lightweight profiling counters."""
+        self._profile_enabled = bool(enabled)
+
+    def get_profile_counters(self) -> dict[str, int]:
+        """Return a shallow copy of the current profiling counters."""
+        return dict(self._profile_counters)
+
+    def reset_profile_counters(self) -> None:
+        """Reset profiling counters to zero."""
+        for key in self._profile_counters:
+            self._profile_counters[key] = 0
+
+    def _bump(self, key: str, by: int = 1) -> None:
+        if self._profile_enabled:
+            self._profile_counters[key] = self._profile_counters.get(key, 0) + by
 
     def reset_for_func(self, func_ea: int) -> bool:
         """Reset recon state -- deduplicates across managers.
@@ -97,21 +148,57 @@ class ReconAnalysisRuntime:
         """
         if func_ea == self._current_func_ea:
             return False  # already reset for this decompilation
-        # Flush previous function's outcomes if not finalized
+        # Flush previous function's outcomes if not finalized.
+        # Flush any pending dirty hints for the previous func first so
+        # we don't lose analyses when decompilation finishes without an
+        # explicit mark_decompilation_finished() on the same EA.
         prev_ea = self._current_func_ea
         if prev_ea != -1:
+            if prev_ea in self._dirty_funcs:
+                try:
+                    self.analyze_dirty_and_persist(prev_ea)
+                except Exception:
+                    logger.exception(
+                        "analyze_dirty_and_persist flush failed for func=0x%x",
+                        prev_ea,
+                    )
             self._persist_outcomes(prev_ea)
+            # Drop the previous func's in-memory cache to keep the dict
+            # bounded across long decompilation sessions.
+            self._results_by_func.pop(prev_ea, None)
+            self._dirty_funcs.discard(prev_ea)
+            self._hints_cache_by_func.pop(prev_ea, None)
+            self._collector_counts_by_func.pop(prev_ea, None)
         self._current_func_ea = func_ea
         self._phase.reset(func_ea=func_ea)
         self._store.clear_func(func_ea=func_ea)
         self._outcome_log.reset_for_func(func_ea)
+        # Clear per-function in-memory cache for the new func.
+        self._results_by_func.pop(func_ea, None)
+        self._dirty_funcs.discard(func_ea)
+        self._hints_cache_by_func.pop(func_ea, None)
+        self._collector_counts_by_func.pop(func_ea, None)
         logger.debug("reset_for_func: func=0x%x prev=0x%x flushed=%s", func_ea, prev_ea, prev_ea != -1)
         return True
 
     def mark_decompilation_finished(self) -> None:
-        """Called at decompilation end -- persist outcomes, then reset guard."""
+        """Called at decompilation end -- persist outcomes, then reset guard.
+
+        Flushes any dirty in-memory hints for the current function before
+        persisting outcomes so that analyses recorded late in the
+        decompilation pass are not lost.
+        """
         if self._current_func_ea != -1:
-            self._persist_outcomes(self._current_func_ea)
+            cur = self._current_func_ea
+            if cur in self._dirty_funcs:
+                try:
+                    self.analyze_dirty_and_persist(cur)
+                except Exception:
+                    logger.exception(
+                        "analyze_dirty_and_persist flush failed for func=0x%x",
+                        cur,
+                    )
+            self._persist_outcomes(cur)
         self._current_func_ea = -1
 
     def _persist_outcomes(self, func_ea: int) -> None:
@@ -121,26 +208,28 @@ class ReconAnalysisRuntime:
         and ``collect_and_analyze``, so this method only handles the
         consumer-outcome rows.
         """
-        # Consumer outcomes
+        # Consumer outcomes (batched in one SQLite transaction).
         reports = self._outcome_log.get_func_reports(func_ea)
-        for report in reports:
-            prov_dict = report.provenance_dict
-            if prov_dict is not None:
-                try:
-                    provenance = json.dumps(prov_dict)
-                except (TypeError, ValueError):
+        if reports:
+            payloads = []
+            for report in reports:
+                prov_dict = report.provenance_dict
+                if prov_dict is not None:
+                    try:
+                        provenance = json.dumps(prov_dict)
+                    except (TypeError, ValueError):
+                        provenance = ""
+                else:
                     provenance = ""
-            else:
-                provenance = ""
-            self._store.save_consumer_outcome(
-                func_ea=func_ea,
-                consumer_name=report.consumer_name,
-                artifacts_available=report.source_artifacts_available,
-                summary_available=report.summary_available,
-                verdict_applied=report.consumer_verdict_applied,
-                detail=report.detail,
-                provenance_json=provenance,
-            )
+                payloads.append((
+                    report.consumer_name,
+                    report.source_artifacts_available,
+                    report.summary_available,
+                    report.consumer_verdict_applied,
+                    report.detail,
+                    provenance,
+                ))
+            self._store.save_consumer_outcomes_bulk(func_ea, payloads)
 
         summary = self._outcome_log.summary(func_ea)
         if summary.get("consumers"):
@@ -239,51 +328,139 @@ class ReconAnalysisRuntime:
             "collect_and_analyze: func=0x%x maturity=%d collectors_fired=%d",
             func_ea, maturity, len(results),
         )
+        if results:
+            self.ingest_results(func_ea, results)
+
+        if persist_hints:
+            return self.analyze_dirty_and_persist(func_ea) or self._analysis.interpret(
+                func_ea=func_ea, results=results, store=self._store,
+            )
+
+        return self._analysis.interpret(
+            func_ea=func_ea, results=results, store=self._store,
+        )
+
+    # ------------------------------------------------------------------
+    # In-memory result cache (Phase 2)
+    # ------------------------------------------------------------------
+
+    def ingest_results(self, func_ea: int, results: list[ReconResult]) -> None:
+        """Stash fresh collector results for *func_ea* without touching SQLite.
+
+        Marks the function dirty so :meth:`analyze_dirty_and_persist` will
+        re-interpret the combined set. Empty input is a no-op.
+        """
+        self._bump("ingest_results_calls")
+        if not results:
+            return
+        bucket = self._results_by_func.setdefault(func_ea, [])
+        bucket.extend(results)
+        self._dirty_funcs.add(func_ea)
+        # Invalidate cached hints because new evidence arrived.
+        self._hints_cache_by_func.pop(func_ea, None)
+        names = self._collector_counts_by_func.setdefault(func_ea, set())
+        non_empty = 0
+        for r in results:
+            names.add(r.collector_name)
+            if r.metrics or r.candidates:
+                non_empty += 1
+            else:
+                self._bump("empty_results_skipped")
+        self._bump("results_ingested", len(results))
+
+    def analyze_dirty_and_persist(
+        self, func_ea: int
+    ) -> DeobfuscationHints | None:
+        """Re-interpret in-memory results for *func_ea* and persist them.
+
+        When the function is dirty, runs :meth:`AnalysisPhase.interpret`
+        on the union of fresh in-memory results plus any on-disk rows for
+        earlier maturities, persists hints and a session summary in one
+        transaction, then clears the dirty flag and caches the hints.
+
+        When the function is not dirty, returns the previously cached
+        hints (or ``None``) without hitting SQLite.
+        """
+        self._bump("analyze_dirty_calls")
+        if func_ea not in self._dirty_funcs:
+            cached = self._hints_cache_by_func.get(func_ea)
+            if cached is not None:
+                self._bump("analyze_dirty_cache_hits")
+            return cached
+
+        in_mem = list(self._results_by_func.get(func_ea, ()))
+        fired_set = set(self._collector_counts_by_func.get(func_ea, set()))
+        if not in_mem and not fired_set:
+            return None
+
+        # Union in-memory with on-disk so analyses include prior maturities.
+        # Prefer memory for (func_ea, maturity, collector_name) collisions.
+        disk = self._store.load_all_recon_results(func_ea=func_ea)
+        self._bump("load_all_recon_results_calls")
+        disk_index = {
+            (int(r.func_ea), int(r.maturity), r.collector_name): r for r in disk
+        }
+        for r in in_mem:
+            disk_index[(int(r.func_ea), int(r.maturity), r.collector_name)] = r
+        results = list(disk_index.values())
+
+        if not results:
+            return None
 
         hints = self._analysis.interpret(
             func_ea=func_ea, results=results, store=self._store,
         )
-
-        if persist_hints:
-            self._store.save_hints(hints)
-            self._store.save_session_summary(
-                func_ea=func_ea,
-                collectors_fired=len({r.collector_name for r in results}),
-                classification=hints.obfuscation_type or "",
-                confidence=hints.confidence,
-                inferences=list(hints.recommended_inferences),
-                suppress_rules=list(hints.suppress_rules),
-            )
-            logger.debug(
-                "collect_and_analyze: persisted hints for func=0x%x type=%s conf=%.2f",
-                func_ea, hints.obfuscation_type, hints.confidence,
-            )
-
+        collectors_fired = len(
+            fired_set
+            if fired_set
+            else {r.collector_name for r in results}
+        )
+        # Persist hints + session summary in a single transaction.
+        self._store.save_analysis_bundle(
+            hints, collectors_fired=collectors_fired,
+        )
+        self._bump("analyze_dirty_persisted")
+        self._dirty_funcs.discard(func_ea)
+        self._hints_cache_by_func[func_ea] = hints
+        logger.info(
+            "analyze_dirty_and_persist: persisted hints for func=0x%x "
+            "(type=%s, confidence=%.2f, collectors=%d)",
+            func_ea, hints.obfuscation_type, hints.confidence, collectors_fired,
+        )
         return hints
 
     def analyze_and_persist(self, func_ea: int) -> DeobfuscationHints | None:
-        """Run analysis on current store contents and persist hints.
+        """Run analysis on current state and persist hints.
 
-        Called eagerly after each collector pass. Returns None if no
-        recon results are available yet.
+        Prefer the in-memory cache when fresh results are available
+        (added in :meth:`ingest_results`); otherwise fall back to
+        loading all rows from the SQLite store.
+
+        Returns ``None`` if no recon results are available.
         """
+        self._bump("analyze_and_persist_calls")
+        # Fast path: hook caller already ingested results; treat them as
+        # dirty and reuse the cached-analytics path.
+        if func_ea in self._results_by_func:
+            self._dirty_funcs.add(func_ea)
+            return self.analyze_dirty_and_persist(func_ea)
+
+        # Backwards-compatible slow path: load everything from the store.
+        if func_ea in self._hints_cache_by_func:
+            return self._hints_cache_by_func[func_ea]
+        self._bump("analyze_and_persist_store_loads")
         results = self._store.load_all_recon_results(func_ea=func_ea)
+        self._bump("load_all_recon_results_calls")
         if not results:
             return None
         hints = self._analysis.interpret(
             func_ea=func_ea, results=results, store=self._store,
         )
-        self._store.save_hints(hints)
-        # Eagerly persist session summary alongside hints so it survives
-        # interrupted decompilations (plugin stop, no hxe_structural).
-        self._store.save_session_summary(
-            func_ea=func_ea,
+        self._store.save_analysis_bundle(
+            hints,
             collectors_fired=len({r.collector_name for r in results}),
-            classification=hints.obfuscation_type or "",
-            confidence=hints.confidence,
-            inferences=list(hints.recommended_inferences),
-            suppress_rules=list(hints.suppress_rules),
         )
+        self._hints_cache_by_func[func_ea] = hints
         logger.info(
             "analyze_and_persist: persisted hints for func=0x%x (type=%s, confidence=%.2f)",
             func_ea, hints.obfuscation_type, hints.confidence,

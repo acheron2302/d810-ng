@@ -392,16 +392,18 @@ class InstructionOptimizerManager(ida_hexrays.optinsn_t):
                         )
             if self._recon_phase is not None:
                 try:
-                    self._recon_phase.run_microcode_collectors(
+                    recon_results = self._recon_phase.run_microcode_collectors(
                         mba, func_ea=mba_ea, maturity=new_maturity
                     )
                 except Exception:
                     optimizer_logger.exception(
                         "ReconPhase failed at maturity %d", new_maturity
                     )
-                if self._recon_runtime is not None:
+                    recon_results = ()
+                if recon_results and self._recon_runtime is not None:
                     try:
-                        hints = self._recon_runtime.analyze_and_persist(mba_ea)
+                        self._recon_runtime.ingest_results(mba_ea, recon_results)
+                        hints = self._recon_runtime.analyze_dirty_and_persist(mba_ea)
                         if hints is not None and self._rule_scope_service is not None:
                             result = self._rule_scope_service.apply_hints(hints)
                             optimizer_logger.info(
@@ -869,14 +871,16 @@ class BlockOptimizerManager(ida_hexrays.optblock_t):
                         )
             if self._recon_phase is not None:
                 try:
-                    self._recon_phase.run_microcode_collectors(
+                    recon_results = self._recon_phase.run_microcode_collectors(
                         mba, func_ea=mba_ea, maturity=mba.maturity
                     )
                 except Exception:
                     optimizer_logger.exception("ReconPhase (block) failed")
-                if self._recon_runtime is not None:
+                    recon_results = ()
+                if recon_results and self._recon_runtime is not None:
                     try:
-                        hints = self._recon_runtime.analyze_and_persist(mba_ea)
+                        self._recon_runtime.ingest_results(mba_ea, recon_results)
+                        hints = self._recon_runtime.analyze_dirty_and_persist(mba_ea)
                         if hints is not None and self._rule_scope_service is not None:
                             result = self._rule_scope_service.apply_hints(hints)
                             optimizer_logger.info(

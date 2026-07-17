@@ -163,7 +163,7 @@ class PathEmulator:
         context: OptimizationContext,
         from_block: ida_hexrays.mblock_t,
         dispatcher: Dispatcher,
-        mop_history: "MopHistory | None" = None
+        mop_history=None
     ) -> EmulationResult:
         """Emulate dispatcher execution with tracked state values.
 
@@ -174,11 +174,21 @@ class PathEmulator:
             context: The optimization context.
             from_block: The predecessor block to emulate from.
             dispatcher: The dispatcher to emulate through.
-            mop_history: Optional pre-computed MopHistory. If None, tracking
-                        is performed automatically from from_block.
+            mop_history: Optional pre-computed MopHistory (or list of
+                MopHistory objects). If None, tracking is performed
+                automatically from from_block.
 
         Returns:
             EmulationResult containing the target block and execution details.
+
+        Phase 7: handle the case where ``mop_history`` is a list of
+        MopHistory objects (which is what ``MopTracker.search_backward``
+        actually returns).  The previous implementation treated it as
+        a single history and would crash on ``mop_history is None``
+        when an empty list was returned.  We now iterate over the list,
+        collect the state values, and only succeed when every non-None
+        value agrees.  Mismatched or unresolved histories yield an
+        unresolved EmulationResult.
         """
         from d810.evaluator.hexrays_microcode.emulator import (
             MicroCodeEnvironment,
@@ -193,36 +203,88 @@ class PathEmulator:
             from_block.serial
         )
 
-        # Step 1: Get or create MopHistory by tracking from from_block
+        # Normalize mop_history to a list[MopHistory | None].
+        histories: list = []
         if mop_history is None:
+            histories = [None]
+        elif isinstance(mop_history, list):
+            if not mop_history:
+                histories = [None]
+            else:
+                histories = list(mop_history)
+        else:
+            histories = [mop_history]
+
+        # Step 1: Get or create MopHistory by tracking from from_block
+        if all(h is None for h in histories):
             if dispatcher.state_variable is None:
                 return EmulationResult(
                     target_block=None,
                     success=False,
                     error_message="Dispatcher has no state variable"
                 )
-            # Track the state variable backwards from from_block
+            # Track the state variable backwards from from_block.
+            # search_backward returns a list[MopHistory] -- pass the
+            # whole list so resolve_target can reason over multiple
+            # histories consistently.
             tracker = MopTracker([dispatcher.state_variable], context.mba)
-            mop_history = tracker.search_backward(from_block)
-            if mop_history is None:
+            tracked = tracker.search_backward(from_block)
+            if not tracked:
                 return EmulationResult(
                     target_block=None,
                     success=False,
-                    error_message=f"Could not track state variable from block {from_block.serial}"
+                    error_message=(
+                        f"Could not track state variable from block "
+                        f"{from_block.serial}"
+                    ),
                 )
+            histories = list(tracked)
 
-        # Step 2: Setup the microcode environment with state variable values
-        microcode_interpreter = MicroCodeInterpreter(symbolic_mode=False)
-        microcode_environment = MicroCodeEnvironment()
-
-        # Get value of the state variable from the tracked history
-        state_value = mop_history.get_mop_constant_value(dispatcher.state_variable)
-        if state_value is None:
+        # Step 2: Collect a consistent state value across all histories.
+        # If any history fails to resolve, or the resolved values
+        # disagree, the dispatcher is not safely resolvable from this
+        # predecessor.
+        state_values: list[int] = []
+        for hist in histories:
+            if hist is None:
+                continue
+            try:
+                v = hist.get_mop_constant_value(dispatcher.state_variable)
+            except Exception:
+                v = None
+            if v is None:
+                # Unresolved history -- cannot emulate safely.
+                return EmulationResult(
+                    target_block=None,
+                    success=False,
+                    error_message=(
+                        f"State variable value not resolvable from block "
+                        f"{from_block.serial}"
+                    ),
+                )
+            state_values.append(int(v))
+        if not state_values:
             return EmulationResult(
                 target_block=None,
                 success=False,
-                error_message=f"State variable value not resolvable from block {from_block.serial}"
+                error_message=(
+                    f"No resolvable state values from block {from_block.serial}"
+                ),
             )
+        if len(set(state_values)) != 1:
+            return EmulationResult(
+                target_block=None,
+                success=False,
+                error_message=(
+                    f"Conflicting state values across histories from block "
+                    f"{from_block.serial}: {state_values}"
+                ),
+            )
+        state_value = state_values[0]
+
+        # Setup the microcode environment with state variable values
+        microcode_interpreter = MicroCodeInterpreter(symbolic_mode=False)
+        microcode_environment = MicroCodeEnvironment()
 
         # Initialize the environment with the state variable value
         microcode_environment.define(dispatcher.state_variable, state_value)

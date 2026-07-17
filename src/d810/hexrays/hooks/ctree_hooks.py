@@ -113,8 +113,9 @@ class CtreeOptimizerManager:
         # _recon_phase is None - guarded for zero overhead when disabled).
         if self._recon_phase is not None:
             func_ea = int(getattr(cfunc, "entry_ea", 0) or 0)
+            recon_results = ()
             try:
-                self._recon_phase.run_ctree_collectors(
+                recon_results = self._recon_phase.run_ctree_collectors(
                     cfunc,
                     func_ea=func_ea,
                     maturity=new_maturity,
@@ -123,12 +124,14 @@ class CtreeOptimizerManager:
                 logger.exception(
                     "ReconPhase (ctree) failed at maturity %d", new_maturity
                 )
-            if self._recon_runtime is not None:
+                recon_results = ()
+            if recon_results and self._recon_runtime is not None:
                 try:
-                    self._recon_runtime.analyze_and_persist(func_ea)
+                    self._recon_runtime.ingest_results(func_ea, recon_results)
+                    self._recon_runtime.analyze_dirty_and_persist(func_ea)
                 except Exception:
                     logger.exception(
-                        "ReconRuntime analyze_and_persist (ctree) failed for func=0x%x",
+                        "ReconRuntime analyze_dirty_and_persist (ctree) failed for func=0x%x",
                         func_ea,
                     )
 

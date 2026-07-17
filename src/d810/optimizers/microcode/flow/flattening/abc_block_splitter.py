@@ -34,6 +34,73 @@ if TYPE_CHECKING:
 logger = getLogger("D810.abc_splitter")
 
 
+def _build_jtbl_case_target_map(
+    dispatcher_info: "GenericDispatcherInfo", mba: ida_hexrays.mba_t
+) -> dict[int, int]:
+    """Build a case_value -> target_serial map for an ``m_jtbl`` dispatcher.
+
+    Returns an empty dict when the dispatcher is not a jtbl, when the
+    case list is not accessible, or when the mapping is ambiguous (e.g.
+    multiple case values map to the same target, or a single case value
+    is not present).  Phase 1: callers use this to short-circuit the
+    expensive MicroCodeInterpreter emulator path.
+
+    Phase 6: prefer the optional Cython-backed wrapper for the raw
+    case/target enumeration; fall back to direct SWIG iteration.
+    """
+    result: dict[int, int] = {}
+    if dispatcher_info is None or dispatcher_info.entry_block is None:
+        return result
+    entry_blk = dispatcher_info.entry_block.blk
+    if entry_blk is None or entry_blk.tail is None:
+        return result
+    # Try the speedup wrapper first.
+    try:
+        from d810.speedups.optimizers.microcode.flow.flattening.unflat_state import (
+            jtbl_case_target_serials as _opt_jtbl_pairs,
+        )
+        pairs = _opt_jtbl_pairs(entry_blk)
+    except Exception:
+        pairs = None
+    if pairs is None:
+        # Python fallback: walk mcases directly.
+        pairs = []
+        if entry_blk.tail.opcode != ida_hexrays.m_jtbl:
+            return result
+        if (
+            entry_blk.tail.r is None
+            or entry_blk.tail.r.t != ida_hexrays.mop_c
+            or entry_blk.tail.r.c is None
+        ):
+            return result
+        mcases = entry_blk.tail.r.c
+        if mcases is None or mcases.values is None or mcases.targets is None:
+            return result
+        try:
+            values_size = mcases.values.size()
+            targets_size = mcases.targets.size()
+        except Exception:
+            return result
+        if values_size != targets_size:
+            return result
+        for i in range(values_size):
+            try:
+                case_values = mcases.values[i]
+                target_serial = int(mcases.targets[i])
+            except Exception:
+                return {}
+            if case_values is None or len(case_values) == 0:
+                continue
+            pairs.append((int(case_values[0]), target_serial))
+    if not pairs:
+        return result
+    for primary, target_serial in pairs:
+        if primary in result and result[primary] != target_serial:
+            return {}
+        result[primary] = target_serial
+    return result
+
+
 @dataclass
 class BlockSplitOperation:
     """Represents a single block split operation to be applied."""
@@ -94,9 +161,35 @@ class ConditionalStateResolver:
     ABC_CONST_MIN: int = 1010000
     ABC_CONST_MAX: int = 1011999
     rewritten_blocks: set[int] = field(default_factory=set)
+    # Phase 1: per-resolver cache for state_value -> mblock_t. Avoids
+    # re-running the expensive MicroCodeInterpreter emulator for state
+    # values we have already resolved.  Holds mblock_t references that
+    # become stale after any CFG mutation -- callers must create a
+    # fresh ConditionalStateResolver at the start of each analyze pass
+    # (which is the current usage pattern in fix_fathers_from_mop_history).
+    state_to_target_cache: dict[int, "ida_hexrays.mblock_t | None"] = field(
+        default_factory=dict
+    )
+    # Phase 1: case_value -> target_serial built from m_jtbl at
+    # construction time.  Used to short-circuit emulate_dispatcher()
+    # when the dispatcher entry is a jtbl and the case->target mapping
+    # is unambiguous.
+    jtbl_case_target_map: dict[int, int] = field(default_factory=dict)
 
     def _is_abc_state(self, value: int) -> bool:
         return self.ABC_CONST_MIN < int(value) < self.ABC_CONST_MAX
+
+    def __post_init__(self) -> None:
+        """Build the jtbl case->target map at construction time.
+
+        Phase 1: this map lets `_resolve_target_for_state` short-circuit
+        the slow emulator path when the dispatcher entry is an `m_jtbl`
+        and the (case_value -> target_serial) mapping is unambiguous
+        (every entry has a unique case value).
+        """
+        self.jtbl_case_target_map = _build_jtbl_case_target_map(
+            self.dispatcher_info, self.mba
+        )
 
     @staticmethod
     def _mask_for_size(size: int) -> int:
@@ -321,7 +414,36 @@ class ConditionalStateResolver:
             return (magic, magic)
 
     def _resolve_target_for_state(self, state_value: int) -> ida_hexrays.mblock_t | None:
-        """Resolve dispatcher target for a given state value."""
+        """Resolve dispatcher target for a given state value.
+
+        Phase 1: prefer the jtbl case->target map (built in
+        ``__post_init__``) when the dispatcher entry is an ``m_jtbl``;
+        fall back to the existing emulator when the map is empty or the
+        case value is not present.  A small per-resolver cache is
+        consulted before either path so repeated state values during a
+        single analyze pass do not pay the emulation cost twice.
+        """
+        # Fast path 1: per-resolver cache hit.
+        if state_value in self.state_to_target_cache:
+            cached_serial = self.state_to_target_cache.get(state_value)
+            if cached_serial is None:
+                return None
+            cached_target = self.mba.get_mblock(int(cached_serial))
+            return cached_target
+
+        # Fast path 2: jtbl direct map (only when the dispatcher entry
+        # tail is m_jtbl -- the map is empty otherwise).
+        jtbl_serial: int | None = self.jtbl_case_target_map.get(int(state_value))
+        if jtbl_serial is not None:
+            target_blk = self.mba.get_mblock(int(jtbl_serial))
+            if target_blk is not None:
+                self.state_to_target_cache[int(state_value)] = int(jtbl_serial)
+                return target_blk
+            # jtbl map pointed at a non-existent serial -- invalidate
+            # the map entry and fall through to emulation.
+            self.jtbl_case_target_map.pop(int(state_value), None)
+
+        # Fallback: emulate the dispatcher with the state value.
         from d810.evaluator.hexrays_microcode.emulator import (
             MicroCodeInterpreter, MicroCodeEnvironment
         )
@@ -340,17 +462,23 @@ class ConditionalStateResolver:
         max_iterations = 100
         for _ in range(max_iterations):
             if not self.dispatcher_info.should_emulation_continue(cur_blk):
+                # Cache the resolved target serial (or None sentinel).
+                self.state_to_target_cache[int(state_value)] = (
+                    int(cur_blk.serial) if cur_blk is not None else None
+                )
                 return cur_blk
 
             is_ok = microcode_interpreter.eval_instruction(
                 cur_blk, cur_ins, microcode_environment
             )
             if not is_ok:
+                self.state_to_target_cache[int(state_value)] = None
                 return None
 
             cur_blk = microcode_environment.next_blk
             cur_ins = microcode_environment.next_ins
 
+        self.state_to_target_cache[int(state_value)] = None
         return None
 
     def _apply_inplace(

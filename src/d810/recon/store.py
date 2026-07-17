@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from types import MappingProxyType
 
@@ -117,8 +118,14 @@ class ReconStore:
     # ReconResult persistence
     # ------------------------------------------------------------------
 
-    def save_recon_result(self, result: ReconResult) -> None:
-        """Upsert a ReconResult (primary key: func_ea, maturity, collector_name)."""
+    def save_recon_result(self, result: ReconResult, *, commit: bool = True) -> None:
+        """Upsert a ReconResult (primary key: func_ea, maturity, collector_name).
+
+        Args:
+            result: The result to persist.
+            commit: When True (default), commit immediately. Pass ``False``
+                when batching multiple writes inside ``transaction()``.
+        """
         self._conn.execute(
             """
             INSERT OR REPLACE INTO recon_results
@@ -134,7 +141,32 @@ class ReconStore:
                 json.dumps([_candidate_to_dict(c) for c in result.candidates]),
             ),
         )
-        self._conn.commit()
+        if commit:
+            self._conn.commit()
+
+    def save_recon_results_bulk(self, results: list[ReconResult]) -> None:
+        """Persist multiple ReconResults in a single SQLite transaction.
+
+        Empty input is a no-op. Commits once even if there are many rows.
+        """
+        if not results:
+            return
+        with self.transaction():
+            for result in results:
+                self.save_recon_result(result, commit=False)
+
+    @contextmanager
+    def transaction(self):
+        """Context manager that commits on success, rolls back on exception.
+
+        Use when batching multiple writes to reduce per-call commit overhead.
+        """
+        try:
+            yield self
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
 
     def load_recon_results(
         self, *, func_ea: int, maturity: int
@@ -228,7 +260,7 @@ class ReconStore:
     # DeobfuscationHints persistence
     # ------------------------------------------------------------------
 
-    def save_hints(self, hints: DeobfuscationHints) -> None:
+    def save_hints(self, hints: DeobfuscationHints, *, commit: bool = True) -> None:
         """Upsert DeobfuscationHints for a function (primary key: func_ea)."""
         self._conn.execute(
             """
@@ -248,7 +280,30 @@ class ReconStore:
                 time.time(),
             ),
         )
-        self._conn.commit()
+        if commit:
+            self._conn.commit()
+
+    def save_analysis_bundle(
+        self,
+        hints: DeobfuscationHints,
+        *,
+        collectors_fired: int,
+    ) -> None:
+        """Persist ``hints`` and the session summary in a single transaction.
+
+        Reduces two commits per analyzed function to one.
+        """
+        with self.transaction():
+            self.save_hints(hints, commit=False)
+            self.save_session_summary(
+                func_ea=hints.func_ea,
+                collectors_fired=collectors_fired,
+                classification=hints.obfuscation_type or "",
+                confidence=hints.confidence,
+                inferences=list(hints.recommended_inferences),
+                suppress_rules=list(hints.suppress_rules),
+                commit=False,
+            )
 
     def load_hints(self, *, func_ea: int) -> DeobfuscationHints | None:
         """Load DeobfuscationHints for a function, or None if not present."""
@@ -293,6 +348,8 @@ class ReconStore:
         confidence: float,
         inferences: list[str],
         suppress_rules: list[str],
+        *,
+        commit: bool = True,
     ) -> None:
         """Persist per-function session summary (upsert)."""
         self._conn.execute(
@@ -302,7 +359,8 @@ class ReconStore:
             (func_ea, time.time(), collectors_fired, classification, confidence,
              json.dumps(inferences), json.dumps(suppress_rules)),
         )
-        self._conn.commit()
+        if commit:
+            self._conn.commit()
 
     def load_session_summary(self, func_ea: int) -> dict | None:
         """Load persisted session summary for a function."""
@@ -334,6 +392,8 @@ class ReconStore:
         verdict_applied: bool,
         detail: str = "",
         provenance_json: str = "",
+        *,
+        commit: bool = True,
     ) -> None:
         """Persist a consumer outcome record (upsert by func_ea + consumer_name)."""
         self._conn.execute(
@@ -344,7 +404,52 @@ class ReconStore:
              int(artifacts_available), int(summary_available), int(verdict_applied),
              detail, provenance_json),
         )
-        self._conn.commit()
+        if commit:
+            self._conn.commit()
+
+    def save_consumer_outcomes_bulk(
+        self,
+        func_ea: int,
+        reports: list,
+    ) -> None:
+        """Persist multiple consumer outcomes in a single transaction.
+
+        Accepts objects exposing ``consumer_name``, ``source_artifacts_available``,
+        ``summary_available``, ``consumer_verdict_applied``, ``detail``, and
+        ``provenance_dict`` (or a 6-tuple of those in that exact order).
+        """
+        if not reports:
+            return
+        import json as _json
+        with self.transaction():
+            for report in reports:
+                if isinstance(report, tuple):
+                    (consumer_name, artifacts_available, summary_available,
+                     verdict_applied, detail, provenance_json) = report
+                else:
+                    consumer_name = report.consumer_name
+                    artifacts_available = report.source_artifacts_available
+                    summary_available = report.summary_available
+                    verdict_applied = report.consumer_verdict_applied
+                    detail = report.detail
+                    prov_dict = getattr(report, "provenance_dict", None)
+                    if prov_dict is not None:
+                        try:
+                            provenance_json = _json.dumps(prov_dict)
+                        except (TypeError, ValueError):
+                            provenance_json = ""
+                    else:
+                        provenance_json = ""
+                self.save_consumer_outcome(
+                    func_ea=func_ea,
+                    consumer_name=consumer_name,
+                    artifacts_available=bool(artifacts_available),
+                    summary_available=bool(summary_available),
+                    verdict_applied=bool(verdict_applied),
+                    detail=detail,
+                    provenance_json=provenance_json,
+                    commit=False,
+                )
 
     def load_consumer_outcomes(self, func_ea: int) -> list[dict]:
         """Load all consumer outcomes for a function."""
@@ -436,6 +541,8 @@ class ReconStore:
         override_type: str,
         override_value: str,
         confidence: float = 1.0,
+        *,
+        commit: bool = True,
     ) -> None:
         """Persist a user classification override (upsert)."""
         self._conn.execute(
@@ -444,7 +551,8 @@ class ReconStore:
             "VALUES (?, ?, ?, ?, ?)",
             (func_ea, override_type, override_value, confidence, time.time()),
         )
-        self._conn.commit()
+        if commit:
+            self._conn.commit()
 
     def load_user_override(
         self, func_ea: int, override_type: str = "classification"
@@ -469,19 +577,19 @@ class ReconStore:
         User overrides persist across decompilation resets so that manual
         classifications survive re-analysis.
         """
-        self._conn.execute(
-            "DELETE FROM recon_results WHERE func_ea = ?", (int(func_ea),)
-        )
-        self._conn.execute(
-            "DELETE FROM deobfuscation_hints WHERE func_ea = ?", (int(func_ea),)
-        )
-        self._conn.execute(
-            "DELETE FROM recon_session_summary WHERE func_ea = ?", (int(func_ea),)
-        )
-        self._conn.execute(
-            "DELETE FROM consumer_outcomes WHERE func_ea = ?", (int(func_ea),)
-        )
-        self._conn.commit()
+        with self.transaction():
+            self._conn.execute(
+                "DELETE FROM recon_results WHERE func_ea = ?", (int(func_ea),)
+            )
+            self._conn.execute(
+                "DELETE FROM deobfuscation_hints WHERE func_ea = ?", (int(func_ea),)
+            )
+            self._conn.execute(
+                "DELETE FROM recon_session_summary WHERE func_ea = ?", (int(func_ea),)
+            )
+            self._conn.execute(
+                "DELETE FROM consumer_outcomes WHERE func_ea = ?", (int(func_ea),)
+            )
 
     def close(self) -> None:
         """Close the database connection."""

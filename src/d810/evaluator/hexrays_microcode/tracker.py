@@ -489,16 +489,64 @@ class SearchContext:
     ) -> int:
         """Create a hashable representation of the unresolved state.
 
-        Uses the mop type and value for hashing to identify equivalent states.
+        Phase 3: avoid the expensive ``format_mop_t()`` stringification
+        path.  We use ``structural_mop_hash()`` which already prefers a
+        Cython fast hasher (when available) and falls back to a cheap
+        Python quick key, both of which are O(1) and avoid ``dstr()``.
+
+        We still group memory vs non-memory mops under distinct domain
+        markers (1 vs 0) so the two categories never collide.
+
+        Phase 6: prefer the optional Cython-backed wrapper
+        ``d810.speedups.optimizers.microcode.flow.flattening.unflat_state``
+        when present.  The wrapper transparently falls back to pure
+        Python if the speedup extension is not built, so this code
+        keeps working unchanged without ``D810_BUILD_SPEEDUPS=1``.
         """
-        # Build tuple of (mop_type, mop_repr) for each unresolved mop
-        state_parts = []
-        for mop in unresolved_mops:
-            # Use type and string representation for uniqueness
-            state_parts.append((mop.t, format_mop_t(mop)))
-        for mop in memory_unresolved_mops:
-            state_parts.append((-1, format_mop_t(mop)))  # -1 to distinguish memory mops
-        return hash(tuple(sorted(state_parts)))
+        try:
+            from d810.speedups.optimizers.microcode.flow.flattening.unflat_state import (
+                hash_unresolved_state as _opt_hash_state,
+            )
+            return int(
+                _opt_hash_state(
+                    list(unresolved_mops), list(memory_unresolved_mops), 0
+                )
+            )
+        except Exception:
+            pass
+        try:
+            from d810.hexrays.utils.hexrays_helpers import structural_mop_hash
+
+            non_memory_parts = []
+            for mop in unresolved_mops:
+                try:
+                    non_memory_parts.append(
+                        (0, int(mop.t), int(structural_mop_hash(mop, 0)))
+                    )
+                except Exception:
+                    # Fall back to stringification for this single mop
+                    # so we never lose correctness because of a hash
+                    # helper failure.
+                    non_memory_parts.append((0, int(mop.t), format_mop_t(mop)))
+
+            memory_parts = []
+            for mop in memory_unresolved_mops:
+                try:
+                    memory_parts.append(
+                        (1, int(mop.t), int(structural_mop_hash(mop, 0)))
+                    )
+                except Exception:
+                    memory_parts.append((1, int(mop.t), format_mop_t(mop)))
+
+            return hash(tuple(sorted(non_memory_parts + memory_parts)))
+        except Exception:
+            # Absolute last-resort fallback: original string-based hash.
+            state_parts = []
+            for mop in unresolved_mops:
+                state_parts.append((mop.t, format_mop_t(mop)))
+            for mop in memory_unresolved_mops:
+                state_parts.append((-1, format_mop_t(mop)))
+            return hash(tuple(sorted(state_parts)))
 
     def check_and_mark_visited(self, blk_serial: int, state_hash: int) -> bool:
         """Check if state was visited; if not, mark it visited.
